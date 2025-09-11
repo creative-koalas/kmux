@@ -14,8 +14,7 @@ from aiorwlock import RWLock
 import aiofiles
 from aiofiles.tempfile import TemporaryDirectory
 
-ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS = \
-"""
+ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS = r"""
 # --- minimal block markers (kmux) ---
 
 # Hardcoded UUID (hex only)
@@ -59,6 +58,10 @@ class BlockPtySession:
         self._tx_q: asyncio.Queue[bytes] = asyncio.Queue()
         self._chunk_to_be_written: bytes | None = None
         self._child_exited_event: asyncio.Event = asyncio.Event()
+        
+        self._pid: int
+        self._master_fd: int
+        self._output_reader_task: asyncio.Task[None]
 
     async def create_zsh_config_dir(self, parent_dir: Path = Path('/tmp')) -> Path:
         """Creates a zsh config directory with a .zshrc file patched with block markers.
@@ -111,7 +114,7 @@ class BlockPtySession:
                 # Child process: exec zsh (interactive)
                 env = os.environ.copy()
                 env['ZDOTDIR'] = str(zsh_config_dir)
-                os.execvp("zsh", ["zsh", "-i"], env)
+                os.execvpe("zsh", ["zsh", "-i"], env)
             else:
                 # Parent process: store handles
                 self._pid = pid
@@ -136,6 +139,12 @@ class BlockPtySession:
         # Register self._on_writable_or_new_write_data to be called whenever the master file descriptor is writable
         asyncio.get_running_loop().add_writer(self._master_fd, self._on_writable_or_new_write_data)
 
+        # Start the output reader loop
+        self._output_reader_task = asyncio.create_task(self._read_output_loop())
+
+        # Perform an initial read to set the read status
+        self._on_readable()
+
         self._started = True
     
     def _remove_reader_and_writer(self):
@@ -150,6 +159,7 @@ class BlockPtySession:
         # Finishes the process when the child process exits
         self._remove_reader_and_writer()
         self._child_exited_event.set()
+        self._output_reader_task.cancel()
 
     def _on_readable(self):
         # Called by event loop when PTY master is readable
@@ -203,6 +213,9 @@ class BlockPtySession:
         if not self._started:
             raise RuntimeError('PTY session not started yet!')
         
+        # Cancel the output reader task
+        self._output_reader_task.cancel()
+        
         # Gracefully close the PTY master FD
         self._remove_reader_and_writer()
 
@@ -217,14 +230,19 @@ class BlockPtySession:
         
         self._stopped = True
     
-    async def _read_all(self) -> bytes:
-        """Reads all the bytes
-        """
-
-        # TODO
+    async def _read_output_loop(self):
+        while True:
+            chunk = await self._rx_q.get()
+            print(repr(chunk), end='')
+            print("Received chunk: ", chunk)
     
-    async def _write_bytes(self, bytes: bytes):
+    async def _write_bytes(self, data: bytes):
         """Write bytes to the pty session.
         """
-        # TODO
+        
+        # Put the data into the write data queue
+        await self._tx_q.put(data)
+
+        # Trigger the writer to be called
+        self._on_writable_or_new_write_data()
     
