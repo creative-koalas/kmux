@@ -1,3 +1,7 @@
+"""
+TODO: Possible resource leaks on unsuccessful startup
+"""
+
 from pathlib import Path
 import os
 import asyncio
@@ -8,8 +12,7 @@ import termios
 import struct
 import errno
 import signal
-
-from aiorwlock import RWLock
+import psutil
 
 import aiofiles
 from aiofiles.tempfile import TemporaryDirectory
@@ -50,7 +53,7 @@ class BlockPtySession:
 
     def __init__(self):
         self._started = False
-        self._stoppped = False
+        self._finished = False
 
         # Receiver end for the pty session master FD
         self._rx_q: asyncio.Queue[bytes] = asyncio.Queue()
@@ -62,6 +65,7 @@ class BlockPtySession:
         self._pid: int
         self._master_fd: int
         self._output_reader_task: asyncio.Task[None]
+        self._close_on_child_exit_task: asyncio.Task[None]
 
     async def create_zsh_config_dir(self, parent_dir: Path = Path('/tmp')) -> Path:
         """Creates a zsh config directory with a .zshrc file patched with block markers.
@@ -139,6 +143,7 @@ class BlockPtySession:
 
         # Start the output reader loop
         self._output_reader_task = asyncio.create_task(self._read_output_loop())
+        self._close_on_child_exit_task = asyncio.create_task(self.close_on_child_exit_loop())
 
         self._started = True
     
@@ -151,10 +156,8 @@ class BlockPtySession:
         asyncio.get_running_loop().remove_writer(self._master_fd)
     
     def _on_child_exited(self):
-        # Finishes the process when the child process exits
-        self._remove_reader_and_writer()
+        # Stops the PTY session when the child process exits
         self._child_exited_event.set()
-        self._output_reader_task.cancel()
     
     def _enable_writer(self):
         asyncio.get_running_loop().add_writer(self._master_fd, self._on_writable_or_new_write_data)
@@ -212,7 +215,11 @@ class BlockPtySession:
                 else:
                     raise
     
-    def stop(self):
+    def _stop(self):
+        if self._finished:
+            # Already finished; return
+            return
+        
         if not self._started:
             raise RuntimeError('PTY session not started yet!')
         
@@ -227,15 +234,19 @@ class BlockPtySession:
         except OSError:
             pass
         
-        # Kill the child process if it's still running
-        if not self._child_exited_event.is_set():
+        # Kill the child process if it's still around
+        if psutil.pid_exists(self._pid):
             os.kill(self._pid, signal.SIGKILL)
         
-        self._stopped = True
+        self._finished = True
     
     async def _read_output_loop(self):
         # TODO
         pass
+
+    async def close_on_child_exit_loop(self):
+        await self._child_exited_event.wait()
+        self._stop()
     
     async def _write_bytes(self, data: bytes):
         """Write bytes to the pty session.
