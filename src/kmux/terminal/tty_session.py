@@ -142,9 +142,6 @@ class BlockPtySession:
         # Start the output reader loop
         self._output_reader_task = asyncio.create_task(self._read_output_loop())
 
-        # Perform an initial read to set the read status
-        self._on_readable()
-
         self._started = True
     
     def _remove_reader_and_writer(self):
@@ -231,10 +228,8 @@ class BlockPtySession:
         self._stopped = True
     
     async def _read_output_loop(self):
-        while True:
-            chunk = await self._rx_q.get()
-            print(repr(chunk), end='')
-            print("Received chunk: ", chunk)
+        # TODO
+        pass
     
     async def _write_bytes(self, data: bytes):
         """Write bytes to the pty session.
