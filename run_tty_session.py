@@ -13,7 +13,7 @@ async def handle_client(reader, writer):
     async def pump_output():
         while True:
             data = await tty_session._rx_q.get()
-            print(data.decode(), end='')
+            print(data.decode(), end='', flush=True)
             if not data:
                 break
             writer.write(data)
