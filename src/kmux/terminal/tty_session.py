@@ -136,8 +136,6 @@ class BlockPtySession:
         # Guaranteed to be in the parent process if we're at this point
         # Register self._on_readable to be called whenever the master file descriptor is readable
         asyncio.get_running_loop().add_reader(self._master_fd, self._on_readable)
-        # Register self._on_writable_or_new_write_data to be called whenever the master file descriptor is writable
-        asyncio.get_running_loop().add_writer(self._master_fd, self._on_writable_or_new_write_data)
 
         # Start the output reader loop
         self._output_reader_task = asyncio.create_task(self._read_output_loop())
@@ -157,6 +155,12 @@ class BlockPtySession:
         self._remove_reader_and_writer()
         self._child_exited_event.set()
         self._output_reader_task.cancel()
+    
+    def _enable_writer(self):
+        asyncio.get_running_loop().add_writer(self._master_fd, self._on_writable_or_new_write_data)
+    
+    def _disable_writer(self):
+        asyncio.get_running_loop().remove_writer(self._master_fd)
 
     def _on_readable(self):
         # Called by event loop when PTY master is readable
@@ -194,6 +198,8 @@ class BlockPtySession:
                     try:
                         self._chunk_to_be_written = self._tx_q.get_nowait()
                     except asyncio.QueueEmpty:
+                        # No more write content (for now); disable writer to avoid busy waiting
+                        self._disable_writer()
                         break
             except OSError as e:
                 if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
@@ -238,6 +244,6 @@ class BlockPtySession:
         # Put the data into the write data queue
         await self._tx_q.put(data)
 
-        # Trigger the writer to be called
-        self._on_writable_or_new_write_data()
+        # Register writer callback
+        self._enable_writer()
     
