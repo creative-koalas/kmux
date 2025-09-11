@@ -1,5 +1,5 @@
 import asyncio
-from src.kmux.terminal.tty_session import BlockPtySession
+from src.kmux.terminal.pty_session import PtySession
 
 async def run_server(host="127.0.0.1", port=5555):
     server = await asyncio.start_server(handle_client, host, port)
@@ -7,19 +7,12 @@ async def run_server(host="127.0.0.1", port=5555):
         await server.serve_forever()
 
 async def handle_client(reader, writer):
-    tty_session = BlockPtySession()
+    tty_session = PtySession(
+        on_new_output_callback=lambda data: print(data.decode(), end='', flush=True),
+        on_session_closed_callback=lambda: print("Session closed")
+    )
+    
     await tty_session.start()
-
-    async def pump_output():
-        while True:
-            data = await tty_session._rx_q.get()
-            print(data.decode(), end='', flush=True)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-
-    asyncio.create_task(pump_output())
 
     try:
         while True:

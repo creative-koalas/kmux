@@ -6,7 +6,7 @@ from pathlib import Path
 import os
 import asyncio
 import pty
-import uuid
+from typing import Callable
 import fcntl
 import termios
 import struct
@@ -17,41 +17,31 @@ import psutil
 import aiofiles
 from aiofiles.tempfile import TemporaryDirectory
 
-ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS = r"""
-# --- minimal block markers (kmux) ---
 
-# Hardcoded UUID (hex only)
-typeset -g KMUX_BLOCK_MARKER_SALT=1b3e62c774b44f78898be928a7aa6532
-
-# DCS wrappers
-typeset -g KMUX_DCS_START=$'\x1bP'   # ESC P
-typeset -g KMUX_DCS_END=$'\x1b\\'    # ESC \  (String Terminator)
-
-kmux_preexec() {
-  # Start marker: ESC P kmux;BLOCKSTART;<uuid_hex> ESC \
-  print -n -- "${KMUX_DCS_START}kmux;BLOCKSTART;${KMUX_BLOCK_MARKER_SALT}${KMUX_DCS_END}"
-}
-
-kmux_precmd() {
-  # End marker: ESC P kmux;BLOCKEND;<uuid_hex> ESC \
-  print -n -- "${KMUX_DCS_START}kmux;BLOCKEND;${KMUX_BLOCK_MARKER_SALT}${KMUX_DCS_END}"
-}
-
-# Register hooks (idempotent-ish)
-typeset -ga preexec_functions precmd_functions
-(( ${preexec_functions[(Ie)kmux_preexec]} )) || preexec_functions+=(kmux_preexec)
-(( ${precmd_functions[(Ie)kmux_precmd]}   )) || precmd_functions+=(kmux_precmd)
-"""
-
-
-class BlockPtySession:
+class PtySession:
     """
-    A pty session with input/output block parsing capabilities.
+    A primitive zsh pty session.
     Currently, we only support `zsh`.
-    Block recognition is done with `preexec` and `precmd` hooks offered by `zsh`.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        zshrc_patch: str = "",
+        on_new_output_callback: Callable[[bytes], None] = lambda _: None,
+        on_session_closed_callback: Callable[[], None] = lambda: None,
+    ):
+        """Creates a PtySession object.
+        Notice that this method does not start the pty session;
+        it only allocates a Python object.
+
+        :param zshrc_patch: The patch to append to the .zshrc file during startup.
+        :param on_new_output_callback: The callback to call when new output is received.
+        :param on_session_closed_callback: The callback to call when the session is closed.
+        This callback is called exactly once after the session is closed
+        (either normally or explictly closed by calling the `stop` method)
+        and the resources are released.
+        """
+
         self._started = False
         self._finished = False
 
@@ -61,54 +51,36 @@ class BlockPtySession:
         self._tx_q: asyncio.Queue[bytes] = asyncio.Queue()
         self._chunk_to_be_written: bytes | None = None
         self._child_exited_event: asyncio.Event = asyncio.Event()
-        
+
         self._pid: int
         self._master_fd: int
         self._output_reader_task: asyncio.Task[None]
         self._close_on_child_exit_task: asyncio.Task[None]
 
-    async def create_zsh_config_dir(self, parent_dir: Path = Path('/tmp')) -> Path:
-        """Creates a zsh config directory with a .zshrc file patched with block markers.
-        :param parent_dir: The parent directory to create the zsh config directory in.
-        :return: The path to the zsh config directory.
-        """
-
-        zsh_config_dir = parent_dir / f'kmux_zsh_config_{uuid.uuid4()}'
-
-        original_zshrc_path = Path(os.getenv("ZDOTDIR") or Path.home()).resolve() / '.zshrc'
-
-        if original_zshrc_path.is_file():
-            async with aiofiles.open(original_zshrc_path, mode='r') as f:
-                zshrc_content = await f.read()
-        else:
-            zshrc_content = ""
-
-        zshrc_content += '\n' + ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS + '\n'
-
-        zshrc_path = Path(zsh_config_dir).resolve() / '.zshrc'
-
-        async with aiofiles.open(zshrc_path, mode='x') as f:
-            await f.write(zshrc_content)
+        self._zshrc_patch: str = zshrc_patch
+        self._on_new_output_callback: Callable[[bytes], None] = on_new_output_callback
+        self._on_session_closed_callback: Callable[[], None] = on_session_closed_callback
 
     async def start(self):
-        """Starts the tty session.
-        """
-        
+        """Starts the tty session."""
+
         # Create a temporary zsh config directory and start zsh process with ZDOTDIR set to it
         async with TemporaryDirectory() as zsh_config_dir:
-            original_zshrc_path = Path(os.getenv("ZDOTDIR") or Path.home()).resolve() / '.zshrc'
+            original_zshrc_path = (
+                Path(os.getenv("ZDOTDIR") or Path.home()).resolve() / ".zshrc"
+            )
 
             if original_zshrc_path.is_file():
-                async with aiofiles.open(original_zshrc_path, mode='r') as f:
+                async with aiofiles.open(original_zshrc_path, mode="r") as f:
                     zshrc_content = await f.read()
             else:
                 zshrc_content = ""
 
-            zshrc_content += '\n' + ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS + '\n'
+            zshrc_content += "\n" + self._zshrc_patch + "\n"
 
-            zshrc_path = Path(zsh_config_dir).resolve() / '.zshrc'
+            zshrc_path = Path(zsh_config_dir).resolve() / ".zshrc"
 
-            async with aiofiles.open(zshrc_path, mode='x') as f:
+            async with aiofiles.open(zshrc_path, mode="x") as f:
                 await f.write(zshrc_content)
 
             # Spawn zsh process with ZDOTDIR set to the temporary directory
@@ -117,13 +89,13 @@ class BlockPtySession:
             if pid == 0:
                 # Child process: exec zsh (interactive)
                 env = os.environ.copy()
-                env['ZDOTDIR'] = str(zsh_config_dir)
+                env["ZDOTDIR"] = str(zsh_config_dir)
                 os.execvpe("zsh", ["zsh", "-i"], env)
             else:
                 # Parent process: store handles
                 self._pid = pid
                 self._master_fd = master_fd
-                
+
                 # Make master FD non-blocking
                 flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
                 fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -136,17 +108,19 @@ class BlockPtySession:
                     termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, cols, 0, 0),
                 )
-        
+
         # Guaranteed to be in the parent process if we're at this point
         # Register self._on_readable to be called whenever the master file descriptor is readable
         asyncio.get_running_loop().add_reader(self._master_fd, self._on_readable)
 
         # Start the output reader loop
         self._output_reader_task = asyncio.create_task(self._read_output_loop())
-        self._close_on_child_exit_task = asyncio.create_task(self.close_on_child_exit_loop())
+        self._close_on_child_exit_task = asyncio.create_task(
+            self.close_on_child_exit_loop()
+        )
 
         self._started = True
-    
+
     def _remove_reader_and_writer(self):
         """Removes the reader and writer on the PTY master FD.
 
@@ -154,14 +128,16 @@ class BlockPtySession:
         """
         asyncio.get_running_loop().remove_reader(self._master_fd)
         asyncio.get_running_loop().remove_writer(self._master_fd)
-    
+
     def _on_child_exited(self):
         # Stops the PTY session when the child process exits
         self._child_exited_event.set()
-    
+
     def _enable_writer(self):
-        asyncio.get_running_loop().add_writer(self._master_fd, self._on_writable_or_new_write_data)
-    
+        asyncio.get_running_loop().add_writer(
+            self._master_fd, self._on_writable_or_new_write_data
+        )
+
     def _disable_writer(self):
         asyncio.get_running_loop().remove_writer(self._master_fd)
 
@@ -172,7 +148,7 @@ class BlockPtySession:
                 chunk = os.read(self._master_fd, 65536)
                 if not chunk:
                     break
-                
+
                 # Guaranteed success since the queue is created with infinite size
                 self._rx_q.put_nowait(chunk)
         except OSError as e:
@@ -185,7 +161,7 @@ class BlockPtySession:
                 return
             else:
                 raise
-    
+
     def _on_writable_or_new_write_data(self):
         # Called by the event loop when PTY master is writable
         while True:
@@ -193,7 +169,9 @@ class BlockPtySession:
                 if self._chunk_to_be_written:
                     bytes_written = os.write(self._master_fd, self._chunk_to_be_written)
                     if bytes_written < len(self._chunk_to_be_written):
-                        self._chunk_to_be_written = self._chunk_to_be_written[bytes_written:]
+                        self._chunk_to_be_written = self._chunk_to_be_written[
+                            bytes_written:
+                        ]
                     else:
                         self._chunk_to_be_written = None
 
@@ -207,25 +185,25 @@ class BlockPtySession:
             except OSError as e:
                 if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     return
-                
+
                 # EIO: slave closed (child exited)
                 if e.errno == errno.EIO:
                     self._on_child_exited()
                     return
                 else:
                     raise
-    
+
     def _stop(self):
         if self._finished:
             # Already finished; return
             return
-        
+
         if not self._started:
-            raise RuntimeError('PTY session not started yet!')
-        
+            raise RuntimeError("PTY session not started yet!")
+
         # Cancel the output reader task
         self._output_reader_task.cancel()
-        
+
         # Gracefully close the PTY master FD
         self._remove_reader_and_writer()
 
@@ -233,28 +211,28 @@ class BlockPtySession:
             os.close(self._master_fd)
         except OSError:
             pass
-        
+
         # Kill the child process if it's still around
         if psutil.pid_exists(self._pid):
             os.kill(self._pid, signal.SIGKILL)
-        
+
         self._finished = True
-    
+        self._on_session_closed_callback()
+
     async def _read_output_loop(self):
-        # TODO
-        pass
+        while True:
+            chunk = await self._rx_q.get()
+            self._on_new_output_callback(chunk)
 
     async def close_on_child_exit_loop(self):
         await self._child_exited_event.wait()
         self._stop()
-    
+
     async def _write_bytes(self, data: bytes):
-        """Write bytes to the pty session.
-        """
-        
+        """Write bytes to the pty session."""
+
         # Put the data into the write data queue
         await self._tx_q.put(data)
 
         # Register writer callback
         self._enable_writer()
-    
