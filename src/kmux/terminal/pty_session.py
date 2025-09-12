@@ -60,6 +60,11 @@ class PtySession:
         self._zshrc_patch: str = zshrc_patch
         self._on_new_output_callback: Callable[[bytes], None] = on_new_output_callback
         self._on_session_closed_callback: Callable[[], None] = on_session_closed_callback
+    
+    async def write_bytes(self, data: bytes):
+        """Writes bytes to the pty session."""
+        await self._write_bytes(data)
+    
 
     async def start(self):
         """Starts the tty session."""
