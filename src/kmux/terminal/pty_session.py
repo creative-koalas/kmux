@@ -13,9 +13,16 @@ import struct
 import errno
 import signal
 import psutil
+from typing import Enum
 
 import aiofiles
 from aiofiles.tempfile import TemporaryDirectory
+
+
+class PtySessionStatus(Enum):
+    NOT_STARTED = 'not_started'
+    RUNNING = 'running'
+    FINISHED = 'finished'
 
 
 class PtySession:
@@ -61,6 +68,18 @@ class PtySession:
         self._on_new_output_callback: Callable[[bytes], None] = on_new_output_callback
         self._on_session_closed_callback: Callable[[], None] = on_session_closed_callback
     
+    @property
+    def status(self) -> PtySessionStatus:
+        if not self._started:
+            return PtySessionStatus.NOT_STARTED
+        elif not self._finished:
+            return PtySessionStatus.RUNNING
+        else:
+            return PtySessionStatus.FINISHED
+    
+    def stop(self):
+        self._stop()
+    
     async def write_bytes(self, data: bytes):
         """Writes bytes to the pty session."""
         await self._write_bytes(data)
@@ -68,6 +87,9 @@ class PtySession:
 
     async def start(self):
         """Starts the tty session."""
+        
+        if self._started:
+            raise RuntimeError("PTY session already started!")
 
         # Create a temporary zsh config directory and start zsh process with ZDOTDIR set to it
         async with TemporaryDirectory() as zsh_config_dir:

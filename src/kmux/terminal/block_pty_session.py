@@ -5,7 +5,7 @@ from datetime import datetime, UTC
 
 from pydantic import BaseModel
 
-from .pty_session import PtySession
+from .pty_session import PtySession, PtySessionStatus
 
 # === Markers injected by zsh hooks ===
 EDITSTART_MARKER = b'\x1bPkmux;EDITSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
@@ -59,9 +59,9 @@ add-zle-hook-widget zle-line-finish kmux_line_finish
 """
 
 
-class PtySessionStatus(Enum):
-    EXECUTING = 'ongoing_command'
-    IDLE = 'awaiting_command'
+class CommandStatus(Enum):
+    EXECUTING = 'executing'
+    IDLE = 'idle'
 
 
 class InvalidOperationError(Exception):
@@ -103,18 +103,23 @@ class BlockPtySession:
         self._tool_lock = asyncio.Lock()
         self._current_command_finish_execution_event = asyncio.Event()
 
-    def _on_new_output(self, data: bytes):
-        old_cumulative_output = self._cumulative_output
-        self._cumulative_output += data
+    @property
+    def session_status(self) -> PtySessionStatus:
+        return self._pty_session.status
+    
+    @property
+    def command_status(self) -> CommandStatus:
+        return self._get_command_status(self._cumulative_output)
 
-        # Wake execution waiter when command execution finishes
-        if self._get_current_status(old_cumulative_output) == PtySessionStatus.EXECUTING \
-            and self._get_current_status(self._cumulative_output) == PtySessionStatus.IDLE:
-            self._current_command_finish_execution_event.set()
+    async def start(self):
+        await self._pty_session.start()
+    
+    async def stop(self):
+        self._pty_session.stop()
 
     async def enter_root_password(self):
         async with self._tool_lock:
-            if self._get_current_status(self._cumulative_output) != PtySessionStatus.EXECUTING:
+            if self._get_command_status(self._cumulative_output) != CommandStatus.EXECUTING:
                 raise InvalidOperationError("This method is available only when a command is running, presumably awaiting password input!")
             if self._root_password is None:
                 raise ValueError("Root privilege not enabled on this zsh session!")
@@ -122,13 +127,13 @@ class BlockPtySession:
 
     async def send_keys(self, keys: str):
         async with self._tool_lock:
-            if self._get_current_status(self._cumulative_output) != PtySessionStatus.EXECUTING:
+            if self._get_command_status(self._cumulative_output) != CommandStatus.EXECUTING:
                 raise InvalidOperationError("This method is available only when a command is running!")
             await self._pty_session.write_bytes(keys.encode())
 
     async def execute_command(self, command: str, timeout_seconds: float = 30.0) -> CommandExecutionResult:
         async with self._tool_lock:
-            if self._get_current_status(self._cumulative_output) != PtySessionStatus.IDLE:
+            if self._get_command_status(self._cumulative_output) != CommandStatus.IDLE:
                 raise InvalidOperationError("This method is available only when the zsh session is awaiting command input!")
 
             self._current_command_finish_execution_event.clear()
@@ -164,13 +169,22 @@ class BlockPtySession:
             
             return current_output[current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER):].decode(errors="ignore")
 
-    def _get_current_status(self, cumulative_output: bytes) -> PtySessionStatus:
+    def _on_new_output(self, data: bytes):
+        old_cumulative_output = self._cumulative_output
+        self._cumulative_output += data
+
+        # Wake execution waiter when command execution finishes
+        if self._get_command_status(old_cumulative_output) == CommandStatus.EXECUTING \
+            and self._get_command_status(self._cumulative_output) == CommandStatus.IDLE:
+            self._current_command_finish_execution_event.set()
+
+    def _get_command_status(self, cumulative_output: bytes) -> CommandStatus:
         # Look for last EXEC markers
         last_exec_start = cumulative_output.rfind(EXECSTART_MARKER)
         last_exec_end   = cumulative_output.rfind(EXECEND_MARKER)
         if last_exec_end > last_exec_start:
-            return PtySessionStatus.IDLE
-        return PtySessionStatus.EXECUTING
+            return CommandStatus.IDLE
+        return CommandStatus.EXECUTING
 
     def _parse_output(self, output: bytes) -> list[CommandBlock]:
         blocks: list[CommandBlock] = []
