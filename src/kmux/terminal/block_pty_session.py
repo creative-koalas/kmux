@@ -1,6 +1,6 @@
 import asyncio
 from enum import Enum
-from typing import Literal
+from typing import Literal, Callable, Coroutine
 from datetime import datetime, UTC
 
 from pydantic import BaseModel
@@ -93,17 +93,30 @@ class BlockPtySession:
       EXECSTART ... EXECEND   (execution phase)
     """
 
-    def __init__(self, root_password: str | None = None):
+    def __init__(self, root_password: str | None = None, on_session_finished_callback: Callable[[], Coroutine[None, None, None]] | None = None):
+        """Creates a BlockPtySession object.
+        Note that this method does not start the pty session;
+        it only allocates a Python object.
+
+        :param root_password: The root password to use for the pty session.
+        :param on_session_finished_callback: The callback to call when the session is finished.
+        This callback is called exactly once after the session is finished
+        (either normally or explictly closed by calling the `stop` method)
+        and the resources are released.
+        """
+        
         self._pty_session = PtySession(
             zshrc_patch=ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS,
             on_new_output_callback=self._on_new_output,
-            on_session_closed_callback=self._on_session_closed,
+            on_session_closed_callback=self._on_session_finished,
         )
 
         self._cumulative_output: bytes = b''
         self._root_password = root_password
         self._tool_lock = asyncio.Lock()
         self._current_command_finish_execution_event = asyncio.Event()
+        self._session_finished_event = asyncio.Event()
+        self._on_session_finished_callback = on_session_finished_callback
 
     @property
     def session_status(self) -> PtySessionStatus:
@@ -190,6 +203,12 @@ class BlockPtySession:
 
         return self._strip_enhancement_codes(current_output[command_start:command_end]).decode(errors="ignore")
     
+    async def watch_session_finished_loop(self):
+        await self._session_finished_event
+
+        if self._on_session_finished_callback is not None:
+            await self._on_session_finished_callback()
+    
     def _strip_enhancement_codes(self, sequence: bytes) -> bytes:
         """Strips enhancement codes (block markers, bracketed paste mode markers, etc.)
         from `sequence`.
@@ -257,5 +276,5 @@ class BlockPtySession:
 
         return blocks
 
-    def _on_session_closed(self):
-        pass
+    def _on_session_finished(self):
+        self._session_finished_event.set()
