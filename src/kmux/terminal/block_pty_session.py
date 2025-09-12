@@ -12,6 +12,8 @@ EDITSTART_MARKER = b'\x1bPkmux;EDITSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
 EDITEND_MARKER   = b'\x1bPkmux;EDITEND;1b3e62c774b44f78898be928a7aa6532\x1b\\'
 EXECSTART_MARKER = b'\x1bPkmux;EXECSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
 EXECEND_MARKER   = b'\x1bPkmux;EXECEND;1b3e62c774b44f78898be928a7aa6532\x1b\\'
+EDIT_START_BRACKET_CODE = b'\x1b[200~'
+EDIT_END_BRACKET_CODE = b'\x1b[201~'
 
 ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS = r"""
 # --- kmux block markers ---
@@ -139,8 +141,9 @@ class BlockPtySession:
             self._current_command_finish_execution_event.clear()
             await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
             start_time = datetime.now(UTC)
+            
             # Use bracketed paste mode to ensure correct behavior when command contains multiple commands
-            await self._pty_session.write_bytes(b"\x1b[200~" + command.encode() + b"\x1b[201~" + b'\r')
+            await self._pty_session.write_bytes(EDIT_START_BRACKET_CODE + command.encode() + EDIT_END_BRACKET_CODE + b'\r')
 
             try:
                 await asyncio.wait_for(self._current_command_finish_execution_event.wait(), timeout=timeout_seconds)
@@ -167,7 +170,41 @@ class BlockPtySession:
             
             current_output = self._cumulative_output
             
-            return current_output[current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER):].decode(errors="ignore")
+            return self._strip_enhancement_codes(current_output[current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER):]).decode(errors="ignore")
+    
+    def get_current_running_command(self) -> str | None:
+        """
+        Returns the currently running command.
+
+        :return: The currently running command, or None if no command is running.
+        """
+
+        # Finds the currently running command.
+        current_output = self._cumulative_output
+        
+        if self._get_command_status(current_output) != CommandStatus.EXECUTING:
+            return None
+        
+        command_start = current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER)
+        command_end = current_output.rfind(EDITEND_MARKER)
+
+        return self._strip_enhancement_codes(current_output[command_start:command_end]).decode(errors="ignore")
+    
+    def _strip_enhancement_codes(self, sequence: bytes) -> bytes:
+        """Strips enhancement codes (block markers, bracketed paste mode markers, etc.)
+        from `sequence`.
+
+        :param sequence: The sequence from which to strip enhancement codes.
+        :return: The sequence with enhancement codes stripped.
+        """
+
+        return sequence \
+            .replace(EDITSTART_MARKER, b'') \
+            .replace(EDITEND_MARKER, b'') \
+            .replace(EXECSTART_MARKER, b'') \
+            .replace(EXECEND_MARKER, b'') \
+            .replace(EDIT_START_BRACKET_CODE, b'') \
+            .replace(EDIT_END_BRACKET_CODE, b'')
 
     def _on_new_output(self, data: bytes):
         old_cumulative_output = self._cumulative_output
@@ -211,7 +248,12 @@ class BlockPtySession:
 
             output = output[output_end + len(EXECEND_MARKER):]
 
-            blocks.append(CommandBlock(command=command.decode(errors="ignore"), output=command_output.decode(errors="ignore")))
+            blocks.append(
+                CommandBlock(
+                    command=self._strip_enhancement_codes(command).decode(errors="ignore"),
+                    output=self._strip_enhancement_codes(command_output).decode(errors="ignore")
+                )
+            )
 
         return blocks
 
