@@ -1,0 +1,180 @@
+from dataclasses import dataclass
+import asyncio
+import logging
+
+from aiorwlock import RWLock
+import yaml
+
+from .block_pty_session import BlockPtySession, PtySessionStatus
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PtySessionItem:
+    session: BlockPtySession
+    label: str | None = None
+    description: str | None = None
+    pending_deletion: bool = False
+
+
+class SessionNotFoundError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+class TerminalServer:
+    
+    def __init__(self, root_password: str | None = None):
+        """Creates a TerminalServer object.
+
+        :param root_password: The root password to use for the pty session.
+        If None, root privilege will not be enabled.
+        """
+
+        self._session_items: dict[str, PtySessionItem] = {}
+        self._next_session_id = 0
+
+        # This lock only ensures no race conditions on the dictionary itself,
+        # but not on individual session items.
+        self._sessions_lock = RWLock()
+        self._root_password = root_password
+
+        self._stopped_sessions_id_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._delete_stopped_sessions_task = asyncio.create_task(self._delete_stopped_sessions_loop())
+    
+    async def create_session(self) -> str:
+        """
+        Creates a new PTY session,
+        returning its ID.
+
+        :return: The ID of the new session.
+        """
+        async with self._sessions_lock.writer():
+            session_id = str(self._next_session_id)
+            self._next_session_id += 1
+            
+            session_item = PtySessionItem(
+                session=None,
+            )
+
+            async def signal_deletion():
+                session_item.pending_deletion = True
+                await self._stopped_sessions_id_queue.put(session_id)
+            
+            session = BlockPtySession(
+                root_password=self._root_password,
+                on_session_finished_callback=signal_deletion
+            )
+
+            session_item.session = session
+
+            self._session_items[session_id] = session_item
+
+            # TODO: Avoid occupying the session lock for too long
+            # However, putting the `start` call inside the critical section
+            # is necessary to ensure that all sessions are started when `list_sessions` is called
+            await session.start()
+
+        return session_id
+    
+    async def list_sessions(self) -> str:
+        async with self._sessions_lock.reader():
+            return yaml.dump([
+                {
+                    "id": session_id,
+                    "label": session_item.label,
+                    "description": session_item.description,
+                    "runningCommand": session_item.session.get_current_running_command() or "(No command is currently running)",
+                } for session_id, session_item in self._session_items.items()
+                if not session_item.pending_deletion
+            ], indent=2)
+    
+    async def update_session_label(self, session_id: str, label: str):
+        async with self._sessions_lock.reader():
+            session_item = self._session_items.get(session_id)
+
+            if not session_item:
+                raise SessionNotFoundError(f"Session {session_id} not found!")
+            
+            session_item.label = label
+
+    async def update_session_description(self, session_id: str, description: str):
+        async with self._sessions_lock.reader():
+            session_item = self._session_items.get(session_id)
+
+            if not session_item:
+                raise SessionNotFoundError(f"Session {session_id} not found!")
+            
+            session_item.description = description
+    
+    async def execute_command(self, session_id: str, command: str) -> str:
+        async with self._sessions_lock.reader():
+            session_item = self._session_items.get(session_id)
+
+            if not session_item:
+                raise SessionNotFoundError(f"Session {session_id} not found!")
+            
+            result = await session_item.session.execute_command(command)
+
+            if result.status == 'finished':
+                return f"""Command finished with the following output:
+<command-output>
+{result.output}
+</command-output>"""
+            else:
+                return f"""Command timed out after {result.timeout_seconds} seconds (i.e., still running)."""
+    
+    async def snapshot(self, session_id: str, include_all: bool = False) -> str:
+        async with self._sessions_lock.reader():
+            session_item = self._session_items.get(session_id)
+
+            if not session_item:
+                raise SessionNotFoundError(f"Session {session_id} not found!")
+            
+            snapshot = session_item.session.snapshot(include_all=include_all)
+
+            return f"""Terminal snapshot ({'including all outputs' if include_all else 'starting from last command input'}):
+<snapshot>
+{snapshot}
+</snapshot>"""
+    
+    async def send_keys(self, session_id: str, keys: str):
+        async with self._sessions_lock.reader():
+            session_item = self._session_items.get(session_id)
+
+            if not session_item:
+                raise SessionNotFoundError(f"Session {session_id} not found!")
+            
+            await session_item.session.send_keys(keys)
+    
+    async def delete_session(self, session_id: str):
+        async with self._sessions_lock.writer():
+            session_item = self._session_items.get(session_id)
+            
+            if not session_item:
+                raise SessionNotFoundError(f"Session {session_id} not found!")
+            
+            session_item.pending_deletion = True
+            await session_item.session.stop()
+            
+            # No need to delete the session;
+            # deletion is signaled by the callback invoked when the session is stopped,
+            # and the session will be subsequently deleted by the custom garbage collection system
+    
+    async def _delete_stopped_sessions_loop(self):
+        while True:
+            session_id = await self._stopped_sessions_id_queue.get()
+
+            async with self._sessions_lock.writer():
+                if session_id not in self._session_items:
+                    logger.warning(f'Session with ID {session_id} not found, skipping deletion')
+                    continue
+                
+                if self._session_items[session_id].session.session_status != PtySessionStatus.FINISHED:
+                    logger.warning(f'Attempting to delete session {session_id} which is not finished, force stopping it; notice that this is not expected behavior (possible bug)!')
+                    await self._session_items[session_id].session.stop()
+
+                del self._session_items[session_id]
+            
