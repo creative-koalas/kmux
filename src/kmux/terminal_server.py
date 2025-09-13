@@ -5,7 +5,7 @@ import logging
 from aiorwlock import RWLock
 import yaml
 
-from .block_pty_session import BlockPtySession, PtySessionStatus
+from .terminal.block_pty_session import BlockPtySession, PtySessionStatus
 
 
 logger = logging.getLogger(__name__)
