@@ -146,7 +146,7 @@ class BlockPtySession:
                 raise InvalidOperationError("This method is available only when a command is running!")
             await self._pty_session.write_bytes(keys.encode())
 
-    async def execute_command(self, command: str, timeout_seconds: float = 30.0) -> CommandExecutionResult:
+    async def execute_command(self, command: str, timeout_seconds: float = 5.0) -> CommandExecutionResult:
         async with self._tool_lock:
             if self._get_command_status(self._cumulative_output) != CommandStatus.IDLE:
                 raise InvalidOperationError("This method is available only when the zsh session is awaiting command input!")
@@ -217,6 +217,8 @@ class BlockPtySession:
         :return: The sequence with enhancement codes stripped.
         """
 
+        return sequence
+
         return sequence \
             .replace(EDITSTART_MARKER, b'') \
             .replace(EDITEND_MARKER, b'') \
@@ -235,12 +237,16 @@ class BlockPtySession:
             self._current_command_finish_execution_event.set()
 
     def _get_command_status(self, cumulative_output: bytes) -> CommandStatus:
-        # Look for last EXEC markers
-        last_exec_start = cumulative_output.rfind(EXECSTART_MARKER)
-        last_exec_end   = cumulative_output.rfind(EXECEND_MARKER)
-        if last_exec_end > last_exec_start:
+        # Look for all markers; if EDITSTART is the last marker, it's idle.
+        last_edit_start_index = cumulative_output.rfind(EDITSTART_MARKER)
+        last_edit_end_index = cumulative_output.rfind(EDITEND_MARKER)
+        last_exec_start_index = cumulative_output.rfind(EXECSTART_MARKER)
+        last_exec_end_index   = cumulative_output.rfind(EXECEND_MARKER)
+
+        if last_edit_start_index == max(last_edit_start_index, last_edit_end_index, last_exec_start_index, last_exec_end_index):
             return CommandStatus.IDLE
-        return CommandStatus.EXECUTING
+        else:
+            return CommandStatus.EXECUTING
 
     def _parse_output(self, output: bytes) -> list[CommandBlock]:
         blocks: list[CommandBlock] = []

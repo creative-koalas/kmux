@@ -51,7 +51,7 @@ class TerminalServer:
 
         :return: The ID of the new session.
         """
-        async with self._sessions_lock.writer():
+        async with self._sessions_lock.writer:
             session_id = str(self._next_session_id)
             self._next_session_id += 1
             
@@ -80,7 +80,10 @@ class TerminalServer:
         return session_id
     
     async def list_sessions(self) -> str:
-        async with self._sessions_lock.reader():
+        async with self._sessions_lock.reader:
+            if len([item for item in self._session_items.values() if not item.pending_deletion]) == 0:
+                return "No sessions."
+
             return yaml.dump([
                 {
                     "id": session_id,
@@ -92,7 +95,7 @@ class TerminalServer:
             ], indent=2)
     
     async def update_session_label(self, session_id: str, label: str):
-        async with self._sessions_lock.reader():
+        async with self._sessions_lock.reader:
             session_item = self._session_items.get(session_id)
 
             if not session_item:
@@ -101,7 +104,7 @@ class TerminalServer:
             session_item.label = label
 
     async def update_session_description(self, session_id: str, description: str):
-        async with self._sessions_lock.reader():
+        async with self._sessions_lock.reader:
             session_item = self._session_items.get(session_id)
 
             if not session_item:
@@ -109,14 +112,14 @@ class TerminalServer:
             
             session_item.description = description
     
-    async def execute_command(self, session_id: str, command: str) -> str:
-        async with self._sessions_lock.reader():
+    async def execute_command(self, session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
+        async with self._sessions_lock.reader:
             session_item = self._session_items.get(session_id)
 
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
-            result = await session_item.session.execute_command(command)
+            result = await session_item.session.execute_command(command, timeout_seconds=timeout_seconds)
 
             if result.status == 'finished':
                 return f"""Command finished in {result.duration_seconds:.2f} seconds with the following output:
@@ -127,13 +130,13 @@ class TerminalServer:
                 return f"""Command timed out after {result.timeout_seconds:.2f} seconds (i.e., still running)."""
     
     async def snapshot(self, session_id: str, include_all: bool = False) -> str:
-        async with self._sessions_lock.reader():
+        async with self._sessions_lock.reader:
             session_item = self._session_items.get(session_id)
 
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
-            snapshot = session_item.session.snapshot(include_all=include_all)
+            snapshot = await session_item.session.snapshot(include_all=include_all)
 
             return f"""Terminal snapshot ({'including all outputs' if include_all else 'starting from last command input'}):
 <snapshot>
@@ -141,7 +144,7 @@ class TerminalServer:
 </snapshot>"""
     
     async def send_keys(self, session_id: str, keys: str):
-        async with self._sessions_lock.reader():
+        async with self._sessions_lock.reader:
             session_item = self._session_items.get(session_id)
 
             if not session_item:
@@ -149,8 +152,17 @@ class TerminalServer:
             
             await session_item.session.send_keys(keys)
     
+    async def enter_root_password(self, session_id: str):
+        async with self._sessions_lock.reader:
+            session_item = self._session_items.get(session_id)
+
+            if not session_item:
+                raise SessionNotFoundError(f"Session {session_id} not found!")
+            
+            await session_item.session.enter_root_password()
+    
     async def delete_session(self, session_id: str):
-        async with self._sessions_lock.writer():
+        async with self._sessions_lock.writer:
             session_item = self._session_items.get(session_id)
             
             if not session_item:
@@ -167,7 +179,7 @@ class TerminalServer:
         while True:
             session_id = await self._stopped_sessions_id_queue.get()
 
-            async with self._sessions_lock.writer():
+            async with self._sessions_lock.writer:
                 if session_id not in self._session_items:
                     logger.warning(f'Session with ID {session_id} not found, skipping deletion')
                     continue

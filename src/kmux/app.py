@@ -83,16 +83,17 @@ async def update_session_description(session_id: str, description: str) -> str:
 
 
 @mcp.tool()
-async def execute_command(session_id: str, command: str) -> str:
+async def execute_command(session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
     """
     Executes a command in a zsh session.
     This tool is only available when the zsh session is awaiting command input.
     
     :param session_id: The ID of the zsh session to execute command.
     :param command: The command to execute.
+    :param timeout_seconds: The timeout in seconds for the command to execute.
     """
     try:
-        return await terminal_server.execute_command(session_id=session_id, command=command)
+        return await terminal_server.execute_command(session_id=session_id, command=command, timeout_seconds=timeout_seconds)
     except Exception as e:
         return f"""Failed to execute command. Error: "{e}"."""
 
@@ -145,7 +146,7 @@ async def snapshot(session_id: str, include_all: bool = False) -> str:
     :param include_all: Whether to include all terminal output starting from terminal startup.
     """
     try:
-        return await terminal_server.snapshot(session_id=session_id, include_all=include_all)
+        return repr(await terminal_server.snapshot(session_id=session_id, include_all=include_all))
     except Exception as e:
         return f"""Failed to take snapshot. Error: "{e}"."""
 

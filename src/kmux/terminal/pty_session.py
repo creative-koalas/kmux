@@ -13,10 +13,15 @@ import struct
 import errno
 import signal
 import psutil
-from typing import Enum
+import logging
+from enum import Enum
+import uuid
+import shutil
 
 import aiofiles
-from aiofiles.tempfile import TemporaryDirectory
+
+
+logger = logging.getLogger(__name__)
 
 
 class PtySessionStatus(Enum):
@@ -92,31 +97,19 @@ class PtySession:
             raise RuntimeError("PTY session already started!")
 
         # Create a temporary zsh config directory and start zsh process with ZDOTDIR set to it
-        async with TemporaryDirectory() as zsh_config_dir:
-            original_zshrc_path = (
-                Path(os.getenv("ZDOTDIR") or Path.home()).resolve() / ".zshrc"
-            )
+        # Spawn zsh process with ZDOTDIR set to the temporary directory
+        tmp_zshrc_directory = Path(f'/tmp/kmux_{uuid.uuid4().hex}').resolve()
+        tmp_zshrc_directory.mkdir(parents=True, exist_ok=False)
 
-            if original_zshrc_path.is_file():
-                async with aiofiles.open(original_zshrc_path, mode="r") as f:
-                    zshrc_content = await f.read()
-            else:
-                zshrc_content = ""
+        try:
+            await self._configure_zshrc(tmp_zshrc_directory)
 
-            zshrc_content += "\n" + self._zshrc_patch + "\n"
-
-            zshrc_path = Path(zsh_config_dir).resolve() / ".zshrc"
-
-            async with aiofiles.open(zshrc_path, mode="x") as f:
-                await f.write(zshrc_content)
-
-            # Spawn zsh process with ZDOTDIR set to the temporary directory
             pid, master_fd = pty.fork()
 
             if pid == 0:
                 # Child process: exec zsh (interactive)
                 env = os.environ.copy()
-                env["ZDOTDIR"] = str(zsh_config_dir)
+                env["ZDOTDIR"] = str(tmp_zshrc_directory)
                 os.execvpe("zsh", ["zsh", "-i"], env)
             else:
                 # Parent process: store handles
@@ -136,17 +129,25 @@ class PtySession:
                     struct.pack("HHHH", rows, cols, 0, 0),
                 )
 
-        # Guaranteed to be in the parent process if we're at this point
-        # Register self._on_readable to be called whenever the master file descriptor is readable
-        asyncio.get_running_loop().add_reader(self._master_fd, self._on_readable)
+            # Guaranteed to be in the parent process if we're at this point
+            # Register self._on_readable to be called whenever the master file descriptor is readable
+            asyncio.get_running_loop().add_reader(self._master_fd, self._on_readable)
 
-        # Start the output reader loop
-        self._output_reader_task = asyncio.create_task(self._read_output_loop())
-        self._close_on_child_exit_task = asyncio.create_task(
-            self.close_on_child_exit_loop()
-        )
+            # Start the output reader loop
+            self._output_reader_task = asyncio.create_task(self._read_output_loop())
+            self._close_on_child_exit_task = asyncio.create_task(
+                self.close_on_child_exit_loop()
+            )
 
-        self._started = True
+            self._started = True
+        finally:
+            # Wait for a period of time and then remove the temporary zsh config directory
+            async def wait_and_delete_zshrc_directory():
+                # TODO: This could be brittle; what if it takes more than 10 seconds for the child to start?
+                await asyncio.sleep(10)
+                shutil.rmtree(tmp_zshrc_directory, ignore_errors=True)
+            
+            asyncio.create_task(wait_and_delete_zshrc_directory())
 
     def _remove_reader_and_writer(self):
         """Removes the reader and writer on the PTY master FD.
@@ -263,3 +264,21 @@ class PtySession:
 
         # Register writer callback
         self._enable_writer()
+    
+    async def _configure_zshrc(self, directory: Path):
+        original_zshrc_path = (
+            Path(os.getenv("ZDOTDIR") or Path.home()).resolve() / ".zshrc"
+        )
+
+        if original_zshrc_path.is_file():
+            async with aiofiles.open(original_zshrc_path, mode="r") as f:
+                zshrc_content = await f.read()
+        else:
+            zshrc_content = ""
+
+        zshrc_content += "\n" + self._zshrc_patch + "\n"
+
+        zshrc_path = directory.resolve() / ".zshrc"
+
+        async with aiofiles.open(zshrc_path, mode="x") as f:
+            await f.write(zshrc_content)
