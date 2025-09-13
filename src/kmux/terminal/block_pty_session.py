@@ -203,7 +203,7 @@ class BlockPtySession:
 
         return self._strip_enhancement_codes(current_output[command_start:command_end]).decode(errors="ignore")
     
-    async def watch_session_finished_loop(self):
+    async def _watch_session_finished_loop(self):
         await self._session_finished_event
 
         if self._on_session_finished_callback is not None:

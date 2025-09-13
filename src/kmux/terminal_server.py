@@ -119,12 +119,12 @@ class TerminalServer:
             result = await session_item.session.execute_command(command)
 
             if result.status == 'finished':
-                return f"""Command finished with the following output:
+                return f"""Command finished in {result.duration_seconds:.2f} seconds with the following output:
 <command-output>
 {result.output}
 </command-output>"""
             else:
-                return f"""Command timed out after {result.timeout_seconds} seconds (i.e., still running)."""
+                return f"""Command timed out after {result.timeout_seconds:.2f} seconds (i.e., still running)."""
     
     async def snapshot(self, session_id: str, include_all: bool = False) -> str:
         async with self._sessions_lock.reader():
@@ -177,4 +177,11 @@ class TerminalServer:
                     await self._session_items[session_id].session.stop()
 
                 del self._session_items[session_id]
-            
+    
+    async def stop(self):
+        """Stops the server.
+        Stops all current terminal sessions.
+        """
+
+        await asyncio.gather(session_item.session.stop() for session_item in self._session_items.values())
+        
