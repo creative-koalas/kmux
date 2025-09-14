@@ -2,11 +2,15 @@ import asyncio
 from enum import Enum
 from typing import Literal, Callable, Coroutine
 from datetime import datetime, UTC
+import logging
 
 from pydantic import BaseModel
 
 from .pty_session import PtySession, PtySessionStatus
 from .utils import render_bytes
+
+
+logger = logging.getLogger()
 
 # === Markers injected by zsh hooks ===
 EDITSTART_MARKER = b'\x1bPkmux;EDITSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
@@ -129,6 +133,7 @@ class BlockPtySession:
         self._current_command_finish_execution_event = asyncio.Event()
         self._session_finished_event = asyncio.Event()
         self._on_session_finished_callback = on_session_finished_callback
+        self._watch_session_finished_task: asyncio.Task
 
     @property
     def session_status(self) -> PtySessionStatus:
@@ -139,6 +144,7 @@ class BlockPtySession:
         return self._get_command_status(self._cumulative_output)
 
     async def start(self):
+        self._watch_session_finished_task = asyncio.create_task(self._watch_session_finished_loop())
         await self._pty_session.start()
     
     async def stop(self):
@@ -233,7 +239,7 @@ class BlockPtySession:
         return self._render(current_output[command_start:command_end])
     
     async def _watch_session_finished_loop(self):
-        await self._session_finished_event
+        await self._session_finished_event.wait()
 
         if self._on_session_finished_callback is not None:
             await self._on_session_finished_callback()
