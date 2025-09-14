@@ -6,7 +6,7 @@ from datetime import datetime, UTC
 from pydantic import BaseModel
 
 from .pty_session import PtySession, PtySessionStatus
-from .utils import strip_ansi
+from .utils import render_bytes
 
 # === Markers injected by zsh hooks ===
 EDITSTART_MARKER = b'\x1bPkmux;EDITSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
@@ -94,7 +94,13 @@ class BlockPtySession:
       EXECSTART ... EXECEND   (execution phase)
     """
 
-    def __init__(self, root_password: str | None = None, on_session_finished_callback: Callable[[], Coroutine[None, None, None]] | None = None):
+    def __init__(
+        self,
+        root_password: str | None = None,
+        on_session_finished_callback: Callable[[], Coroutine[None, None, None]] | None = None,
+        screen_width: int = 80,
+        screen_height: int = 24,
+    ):
         """Creates a BlockPtySession object.
         Note that this method does not start the pty session;
         it only allocates a Python object.
@@ -110,7 +116,12 @@ class BlockPtySession:
             zshrc_patch=ZSH_BLOCK_MARKER_REGISTRATION_COMMANDS,
             on_new_output_callback=self._on_new_output,
             on_session_closed_callback=self._on_session_finished,
+            screen_width=screen_width,
+            screen_height=screen_height,
         )
+        
+        self._screen_width = screen_width
+        self._screen_height = screen_height
 
         self._cumulative_output: bytes = b''
         self._root_password = root_password
@@ -180,11 +191,11 @@ class BlockPtySession:
         
         async with self._tool_lock:
             if include_all:
-                return self._strip_enhancement_codes(self._cumulative_output).decode(errors="ignore")
+                return self._render(self._cumulative_output)
             
             current_output = self._cumulative_output
             
-            return self._strip_enhancement_codes(current_output[current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER):]).decode(errors="ignore")
+            return self._render(current_output[current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER):])
     
     def get_current_running_command(self) -> str | None:
         """
@@ -202,7 +213,7 @@ class BlockPtySession:
         command_start = current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER)
         command_end = current_output.rfind(EDITEND_MARKER)
 
-        return self._strip_enhancement_codes(current_output[command_start:command_end]).decode(errors="ignore")
+        return self._render(current_output[command_start:command_end])
     
     async def _watch_session_finished_loop(self):
         await self._session_finished_event
@@ -210,26 +221,27 @@ class BlockPtySession:
         if self._on_session_finished_callback is not None:
             await self._on_session_finished_callback()
     
-    def _strip_enhancement_codes(self, sequence: bytes) -> bytes:
-        """Strips enhancement codes (block markers, bracketed paste mode markers, etc.)
-        from `sequence`.
+    def _render(self, data: bytes) -> str:
+        """Renders bytes into human-readable terminal screen.
 
-        :param sequence: The sequence from which to strip enhancement codes.
-        :return: The sequence with enhancement codes stripped.
+        :param data: The bytes to render.
+        :return: The rendered screen.
         """
 
-        return strip_ansi(sequence)
+        # TODO: Potential performance issue:
+        # Right now we're instantiating a new pyte.HistoryScreen each time we call this method.
+        
+        data = data \
+            .replace(EDITSTART_MARKER, b'') \
+            .replace(EDITEND_MARKER, b'') \
+            .replace(EXECSTART_MARKER, b'') \
+            .replace(EXECEND_MARKER, b'')
+        
+        content = '\n'.join(s.rstrip() for s in render_bytes(data, screen_width=self._screen_width, screen_height=self._screen_height))
 
-        # return sequence
-
-        # return sequence \
-        #     .replace(EDITSTART_MARKER, b'') \
-        #     .replace(EDITEND_MARKER, b'') \
-        #     .replace(EXECSTART_MARKER, b'') \
-        #     .replace(EXECEND_MARKER, b'') \
-        #     .replace(EDIT_START_BRACKET_CODE, b'') \
-        #     .replace(EDIT_END_BRACKET_CODE, b'')
-
+        # FIXME: This would remove the deliberately added leading and trailing blank lines and spaces in the original bytes as well
+        return content.rstrip()
+    
     def _on_new_output(self, data: bytes):
         old_cumulative_output = self._cumulative_output
         self._cumulative_output += data
@@ -278,8 +290,8 @@ class BlockPtySession:
 
             blocks.append(
                 CommandBlock(
-                    command=self._strip_enhancement_codes(command).decode(errors="ignore"),
-                    output=self._strip_enhancement_codes(command_output).decode(errors="ignore")
+                    command=self._render(command),
+                    output=self._render(command_output),
                 )
             )
 

@@ -41,6 +41,8 @@ class PtySession:
         zshrc_patch: str = "",
         on_new_output_callback: Callable[[bytes], None] = lambda _: None,
         on_session_closed_callback: Callable[[], None] = lambda: None,
+        screen_width: int = 80,
+        screen_height: int = 24,
     ):
         """Creates a PtySession object.
         Notice that this method does not start the pty session;
@@ -52,10 +54,14 @@ class PtySession:
         This callback is called exactly once after the session is closed
         (either normally or explictly closed by calling the `stop` method)
         and the resources are released.
+        :param screen_width: The width of the terminal screen.
+        :param screen_height: The height of the terminal screen.
         """
 
         self._started = False
         self._finished = False
+        self._screen_width = screen_width
+        self._screen_height = screen_height
 
         # Receiver end for the pty session master FD
         self._rx_q: asyncio.Queue[bytes] = asyncio.Queue()
@@ -122,7 +128,7 @@ class PtySession:
 
                 # Optionally set initial window size (rows, cols)
                 #    You can expose this as an API; here we set a sane default.
-                rows, cols = 40, 120
+                rows, cols = self._screen_height, self._screen_width
                 fcntl.ioctl(
                     master_fd,
                     termios.TIOCSWINSZ,

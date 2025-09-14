@@ -146,7 +146,7 @@ async def snapshot(session_id: str, include_all: bool = False) -> str:
     :param include_all: Whether to include all terminal output starting from terminal startup.
     """
     try:
-        return repr(await terminal_server.snapshot(session_id=session_id, include_all=include_all))
+        return await terminal_server.snapshot(session_id=session_id, include_all=include_all)
     except Exception as e:
         return f"""Failed to take snapshot. Error: "{e}"."""
 
