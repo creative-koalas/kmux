@@ -6,6 +6,7 @@ from datetime import datetime, UTC
 from pydantic import BaseModel
 
 from .pty_session import PtySession, PtySessionStatus
+from .utils import strip_ansi
 
 # === Markers injected by zsh hooks ===
 EDITSTART_MARKER = b'\x1bPkmux;EDITSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
@@ -179,7 +180,7 @@ class BlockPtySession:
         
         async with self._tool_lock:
             if include_all:
-                return self._cumulative_output.decode(errors="ignore")
+                return self._strip_enhancement_codes(self._cumulative_output).decode(errors="ignore")
             
             current_output = self._cumulative_output
             
@@ -217,15 +218,17 @@ class BlockPtySession:
         :return: The sequence with enhancement codes stripped.
         """
 
-        return sequence
+        return strip_ansi(sequence)
 
-        return sequence \
-            .replace(EDITSTART_MARKER, b'') \
-            .replace(EDITEND_MARKER, b'') \
-            .replace(EXECSTART_MARKER, b'') \
-            .replace(EXECEND_MARKER, b'') \
-            .replace(EDIT_START_BRACKET_CODE, b'') \
-            .replace(EDIT_END_BRACKET_CODE, b'')
+        # return sequence
+
+        # return sequence \
+        #     .replace(EDITSTART_MARKER, b'') \
+        #     .replace(EDITEND_MARKER, b'') \
+        #     .replace(EXECSTART_MARKER, b'') \
+        #     .replace(EXECEND_MARKER, b'') \
+        #     .replace(EDIT_START_BRACKET_CODE, b'') \
+        #     .replace(EDIT_END_BRACKET_CODE, b'')
 
     def _on_new_output(self, data: bytes):
         old_cumulative_output = self._cumulative_output
