@@ -195,7 +195,24 @@ class BlockPtySession:
             
             current_output = self._cumulative_output
             
-            return self._render(current_output[current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER):])
+            command_status = self._get_command_status(current_output)
+            if command_status == CommandStatus.EXECUTING:
+                last_exec_end_index = current_output.rfind(EXECEND_MARKER)
+                return self._render(
+                    current_output[
+                        last_exec_end_index + len(EXECEND_MARKER) if last_exec_end_index != -1 else 0:
+                    ]
+                )
+            elif command_status == CommandStatus.IDLE:
+                # Find the second to last EDITSTART marker
+                second_to_last_exec_end_index = current_output.rfind(EXECEND_MARKER, 0, current_output.rfind(EXECEND_MARKER))
+                return self._render(
+                    current_output[
+                        second_to_last_exec_end_index + len(EXECEND_MARKER) if second_to_last_exec_end_index != -1 else 0:
+                    ]
+                )
+            else:
+                raise Exception(f'Invalid command status: {command_status}')
     
     def get_current_running_command(self) -> str | None:
         """
