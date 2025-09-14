@@ -135,6 +135,8 @@ class BlockPtySession:
         self._on_session_finished_callback = on_session_finished_callback
         self._watch_session_finished_task: asyncio.Task
 
+        self._current_command: str | None = None
+
     @property
     def session_status(self) -> PtySessionStatus:
         return self._pty_session.status
@@ -175,6 +177,8 @@ class BlockPtySession:
             
             # Use bracketed paste mode to ensure correct behavior when command contains multiple commands
             await self._pty_session.write_bytes(EDIT_START_BRACKET_CODE + command.encode() + EDIT_END_BRACKET_CODE + b'\r')
+
+            self._current_command = command
 
             try:
                 await asyncio.wait_for(self._current_command_finish_execution_event.wait(), timeout=timeout_seconds)
@@ -233,10 +237,17 @@ class BlockPtySession:
         if self._get_command_status(current_output) != CommandStatus.EXECUTING:
             return None
         
-        command_start = current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER)
-        command_end = current_output.rfind(EDITEND_MARKER)
+        # TODO: Well, we just can't seem to get the bytes between edit start & end markers to render correctly,.
+        # so we're falling back to using a manually managed variable.
+        # Of course, this could pose some robustness issues,
+        # but given that `send_keys` is denied when there is no running command,
+        # this method should work fine in most cases.
+        return self._current_command
+        
+        # command_start = current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER)
+        # command_end = current_output.rfind(EDITEND_MARKER)
 
-        return self._render(current_output[command_start:command_end])
+        # return self._render(current_output[command_start:command_end])
     
     async def _watch_session_finished_loop(self):
         await self._session_finished_event.wait()
