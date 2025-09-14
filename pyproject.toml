@@ -1,6 +1,6 @@
 [project]
 name = "kmux"
-version = "0.1.0"
+version = "0.0.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -19,3 +19,9 @@ dependencies = [
 dev = [
     "ipython>=9.5.0",
 ]
+
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+publish-url = "https://test.pypi.org/legacy/"
+explicit = true

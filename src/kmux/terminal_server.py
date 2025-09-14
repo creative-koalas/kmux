@@ -92,7 +92,7 @@ class TerminalServer:
                     "runningCommand": session_item.session.get_current_running_command() or "(No command is currently running)",
                 } for session_id, session_item in self._session_items.items()
                 if not session_item.pending_deletion
-            ], indent=2)
+            ], sort_keys=False, indent=2)
     
     async def update_session_label(self, session_id: str, label: str):
         async with self._sessions_lock.reader:
