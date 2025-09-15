@@ -1,5 +1,7 @@
 # kmux
 
+[中文](./README_zh.md)
+
 Terminal MCP server of the AI, for the AI, but by Creative Koalas.
 
 ## What is kmux?
@@ -183,6 +185,6 @@ without the need to see the full outputs.**
 
 This is useful because while humans would just look at the terminal screen and title,
 the only way for LLMs to get "metadata" of a terminal session is through a specific MCP tool.
-Hence, making list_session return not only the session IDs but also the metadata
+Hence, making the session listing MCP tool return not only the session IDs but also the metadata
 would make it much easier for LLMs to quickly know what is going on in each session
 and help them to decide what to do next.
