@@ -18,6 +18,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ipython>=9.5.0",
+    "pytest>=8.4.2",
+    "coverage>=7.10.6",
+    "pytest-asyncio>=1.2.0",
 ]
 
 [[tool.uv.index]]
@@ -25,3 +28,21 @@ name = "testpypi"
 url = "https://test.pypi.org/simple/"
 publish-url = "https://test.pypi.org/legacy/"
 explicit = true
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["**/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel>=0.40.0"]
+build-backend = "setuptools.build_meta"
