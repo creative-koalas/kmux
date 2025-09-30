@@ -214,30 +214,30 @@ class BlockPtySession:
         if include_all is True, it returns the all terminal output starting from terminal startup.
         """
         
-        async with self._tool_lock:
-            if include_all:
-                return self._render(self._cumulative_output)
-            
-            current_output = self._cumulative_output
-            
-            command_status = self._get_command_status(current_output)
-            if command_status == CommandStatus.EXECUTING:
-                last_exec_end_index = current_output.rfind(EXECEND_MARKER)
-                return self._render(
-                    current_output[
-                        last_exec_end_index + len(EXECEND_MARKER) if last_exec_end_index != -1 else 0:
-                    ]
-                )
-            elif command_status == CommandStatus.IDLE:
-                # Find the second to last EDITSTART marker
-                second_to_last_exec_end_index = current_output.rfind(EXECEND_MARKER, 0, current_output.rfind(EXECEND_MARKER))
-                return self._render(
-                    current_output[
-                        second_to_last_exec_end_index + len(EXECEND_MARKER) if second_to_last_exec_end_index != -1 else 0:
-                    ]
-                )
-            else:
-                raise Exception(f'Invalid command status: {command_status}')
+        cumulative_output = self._cumulative_output
+        if include_all:
+            return self._render(cumulative_output)
+        
+        current_output = cumulative_output
+        
+        command_status = self._get_command_status(current_output)
+        if command_status == CommandStatus.EXECUTING:
+            last_exec_end_index = current_output.rfind(EXECEND_MARKER)
+            return self._render(
+                current_output[
+                    last_exec_end_index + len(EXECEND_MARKER) if last_exec_end_index != -1 else 0:
+                ]
+            )
+        elif command_status == CommandStatus.IDLE:
+            # Find the second to last EDITSTART marker
+            second_to_last_exec_end_index = current_output.rfind(EXECEND_MARKER, 0, current_output.rfind(EXECEND_MARKER))
+            return self._render(
+                current_output[
+                    second_to_last_exec_end_index + len(EXECEND_MARKER) if second_to_last_exec_end_index != -1 else 0:
+                ]
+            )
+        else:
+            raise Exception(f'Invalid command status: {command_status}')
     
     def get_current_running_command(self) -> str | None:
         """
