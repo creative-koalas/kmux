@@ -17,7 +17,16 @@ class TerminalServerConfig(BaseModel):
     """The timeout for session startup and initialization.
     If None, the server will wait and hold the lock indefinitely until the session is initialized
     (this is not recommended)."""
+    
+    general_tool_call_timeout_seconds: float | None = 5.0
+    """The generic timeout for tool calls. This applies to all tool calls except `create_session` and `execute_command`."""
 
+
+class TollCallTimeoutError(Exception):
+    
+    def __init__(self, timeout_seconds: float, message: str | None = None):
+        self.timeout_seconds = timeout_seconds
+        self.message = message or f"Tool call timeout after {timeout_seconds} seconds"
 
 
 @dataclass
@@ -95,7 +104,7 @@ class TerminalServer:
         return session_id
     
     async def list_sessions(self) -> str:
-        async with self._sessions_lock.reader:
+        async def lock_guarded_job():
             if len([item for item in self._session_items.values() if not item.pending_deletion]) == 0:
                 return "No sessions."
 
@@ -110,9 +119,16 @@ class TerminalServer:
                 } for session_id, session_item in self._session_items.items()
                 if not session_item.pending_deletion
             ], sort_keys=False, indent=2)
+
+        async with self._sessions_lock.reader:
+            try:
+                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'`list_sessions` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
+                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
     async def update_session_label(self, session_id: str, label: str):
-        async with self._sessions_lock.reader:
+        async def lock_guarded_job():
             session_item = self._session_items.get(session_id)
 
             if not session_item:
@@ -120,14 +136,28 @@ class TerminalServer:
             
             session_item.label = label
 
-    async def update_session_description(self, session_id: str, description: str):
         async with self._sessions_lock.reader:
+            try:
+                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'`update_session_label` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
+                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
+
+    async def update_session_description(self, session_id: str, description: str):
+        async def lock_guarded_job():
             session_item = self._session_items.get(session_id)
 
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
             session_item.description = description
+
+        async with self._sessions_lock.reader:
+            try:
+                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'`update_session_description` timed out after {self._config.general_tool_call_timeout_seconds} seconds')
+                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
     async def execute_command(self, session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
         async with self._sessions_lock.reader:
@@ -136,7 +166,14 @@ class TerminalServer:
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
-            result = await session_item.session.execute_command(command, timeout_seconds=timeout_seconds)
+            # TODO: Parameterize this?
+            tool_call_timeout = timeout_seconds + 1
+            
+            try:
+                result = await asyncio.wait_for(session_item.session.execute_command(command, timeout_seconds=timeout_seconds), timeout=tool_call_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f'`BlockPtySession.execute_command` timeout after {tool_call_timeout} seconds (command execution timeout was {timeout_seconds} seconds)')
+                return f"Tool call itself timeout after {tool_call_timeout} seconds. Command may or may not have been submitted to the terminal session; consider coming back and checking this terminal session later."
 
             if result.status == 'finished':
                 return f"""Command finished in {result.duration_seconds:.2f} seconds with the following output:
@@ -147,7 +184,8 @@ class TerminalServer:
                 return f"""Command timed out after {result.timeout_seconds:.2f} seconds (i.e., still running)."""
     
     async def snapshot(self, session_id: str, include_all: bool = False) -> str:
-        async with self._sessions_lock.reader:
+        
+        async def lock_guarded_job():
             session_item = self._session_items.get(session_id)
 
             if not session_item:
@@ -159,27 +197,48 @@ class TerminalServer:
 <snapshot>
 {snapshot}
 </snapshot>"""
+
+        async with self._sessions_lock.reader:
+            try:
+                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'`snapshot` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
+                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
     async def send_keys(self, session_id: str, keys: str):
-        async with self._sessions_lock.reader:
+        async def lock_guarded_job():
             session_item = self._session_items.get(session_id)
 
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
             await session_item.session.send_keys(keys)
+
+        async with self._sessions_lock.reader:
+            try:
+                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'`send_keys` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
+                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
     async def enter_root_password(self, session_id: str):
-        async with self._sessions_lock.reader:
+        async def lock_guarded_job():
             session_item = self._session_items.get(session_id)
 
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
             await session_item.session.enter_root_password()
+
+        async with self._sessions_lock.reader:
+            try:
+                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'`enter_root_password` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
+                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
     async def delete_session(self, session_id: str):
-        async with self._sessions_lock.writer:
+        async def lock_guarded_job():
             session_item = self._session_items.get(session_id)
             
             if not session_item:
@@ -191,6 +250,13 @@ class TerminalServer:
             # No need to delete the session;
             # deletion is signaled by the callback invoked when the session is stopped,
             # and the session will be subsequently deleted by the custom garbage collection system
+        
+        async with self._sessions_lock.writer:
+            try:
+                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'`delete_session` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
+                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
     async def _delete_stopped_sessions_loop(self):
         while True:
