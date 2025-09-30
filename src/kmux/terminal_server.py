@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import asyncio
 import logging
+from pydantic import BaseModel
 
 from aiorwlock import RWLock
 import yaml
@@ -9,6 +10,14 @@ from .terminal.block_pty_session import BlockPtySession, PtySessionStatus
 
 
 logger = logging.getLogger(__name__)
+
+
+class TerminalServerConfig(BaseModel):
+    session_startup_timeout_seconds: float | None = 10.0
+    """The timeout for session startup and initialization.
+    If None, the server will wait and hold the lock indefinitely until the session is initialized
+    (this is not recommended)."""
+
 
 
 @dataclass
@@ -26,7 +35,11 @@ class SessionNotFoundError(Exception):
 
 class TerminalServer:
     
-    def __init__(self, root_password: str | None = None):
+    def __init__(
+        self,
+        config: TerminalServerConfig = TerminalServerConfig(),
+        root_password: str | None = None
+    ):
         """Creates a TerminalServer object.
 
         :param root_password: The root password to use for the pty session.
@@ -39,6 +52,8 @@ class TerminalServer:
         # This lock only ensures no race conditions on the dictionary itself,
         # but not on individual session items.
         self._sessions_lock = RWLock()
+
+        self._config = config
         self._root_password = root_password
 
         self._stopped_sessions_id_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -72,10 +87,10 @@ class TerminalServer:
 
             self._session_items[session_id] = session_item
 
-            # TODO: Avoid occupying the session lock for too long
-            # However, putting the `start` call inside the critical section
-            # is necessary to ensure that all sessions are started when `list_sessions` is called
-            await session.start()
+            try:
+                await asyncio.wait_for(session.start(), timeout=self._config.session_startup_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning(f'Zsh session {session_id} failed to initialize within {self._config.session_startup_timeout_seconds} seconds; initialization job moved to background.')
 
         return session_id
     

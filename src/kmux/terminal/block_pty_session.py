@@ -135,6 +135,8 @@ class BlockPtySession:
         self._on_session_finished_callback = on_session_finished_callback
         self._watch_session_finished_task: asyncio.Task
 
+        self._session_initialized = False
+
         self._current_command: str | None = None
 
     @property
@@ -144,10 +146,23 @@ class BlockPtySession:
     @property
     def command_status(self) -> CommandStatus:
         return self._get_command_status(self._cumulative_output)
+    
+    @property
+    def session_initialized(self) -> bool:
+        """Whether the session is initialized (i.e., `.zshrc` sourced successfully) and ready to go.
+        """
+        return self._session_initialized
 
     async def start(self):
+        # FIXME: This does not account for the case where `start` is called by multiple callers simultaneously;
+        # Need to add another flag
+        if self._session_initialized:
+            raise RuntimeError("Session already initialized!")
+        
         self._watch_session_finished_task = asyncio.create_task(self._watch_session_finished_loop())
         await self._pty_session.start()
+
+        self._session_initialized = True
     
     async def stop(self):
         self._pty_session.stop()
