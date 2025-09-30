@@ -102,9 +102,11 @@ class TerminalServer:
             return yaml.dump([
                 {
                     "id": session_id,
-                    "label": session_item.label,
-                    "description": session_item.description,
-                    "runningCommand": session_item.session.get_current_running_command() or "(No command is currently running)",
+                    "metadata": {
+                        "label": session_item.label,
+                        "description": session_item.description,
+                        "runningCommand": session_item.session.get_current_running_command() or "(No command is currently running)"
+                    } if session_item.session.session_initialized else "(Session still initializing...)"
                 } for session_id, session_item in self._session_items.items()
                 if not session_item.pending_deletion
             ], sort_keys=False, indent=2)
