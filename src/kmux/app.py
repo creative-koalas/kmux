@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 
 from .terminal_server import TerminalServer
+from .documentation import PLUGIN_GENERAL_DOCUMENTATION
 
 
 terminal_server: TerminalServer
@@ -25,6 +26,11 @@ async def lifespan(app: FastMCP):
 
 
 mcp = FastMCP(lifespan=lifespan)
+
+@mcp.prompt(name="_plugin_general_documentation")
+async def plugin_general_documentation() -> str:
+    """AutoMate standard plugin documentation access point."""
+    return PLUGIN_GENERAL_DOCUMENTATION
 
 
 @mcp.tool()
