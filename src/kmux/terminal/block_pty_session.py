@@ -184,7 +184,7 @@ class BlockPtySession:
     async def execute_command(self, command: str, timeout_seconds: float = 5.0) -> CommandExecutionResult:
         async with self._tool_lock:
             if self._get_command_status(self._cumulative_output) != CommandStatus.IDLE:
-                raise InvalidOperationError("This method is available only when the zsh session is awaiting command input!")
+                raise InvalidOperationError("This method is available only when the zsh session is awaiting command input; right now there is still a command running.")
 
             self._current_command_finish_execution_event.clear()
             await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
