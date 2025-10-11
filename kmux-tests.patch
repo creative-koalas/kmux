@@ -1,0 +1,147 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 0000000..1111111 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -13,7 +13,10 @@ dependencies = [
+ ]
+ 
+ [dependency-groups]
+ dev = [
+-    "ipython>=9.5.0",
++    "ipython>=9.5.0",
++    "pytest>=8.3.3",
++    "pytest-asyncio>=0.24.0",
++    "pytest-cov>=5.0.0",
+ ]
+ 
+ [[tool.uv.index]]
+ name = "testpypi"
+ url = "https://test.pypi.org/simple/"
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,8 @@
++# Ensure src/ is importable without installing the package
++import sys
++from pathlib import Path
++
++root = Path(__file__).resolve().parents[1]
++src = root / "src"
++if str(src) not in sys.path:
++    sys.path.insert(0, str(src))
+diff --git a/tests/test_pty_session.py b/tests/test_pty_session.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/tests/test_pty_session.py
+@@ -0,0 +1,16 @@
++import asyncio
++import pytest
++
++from kmux.terminal.pty_session import PtySession, PtySessionStatus
++
++pytestmark = pytest.mark.asyncio
++
++async def test_pty_session_start_stop():
++    s = PtySession()
++    assert s.status == PtySessionStatus.NOT_STARTED
++    await s.start()
++    assert s.status == PtySessionStatus.RUNNING
++    # Give it a moment to fully initialize
++    await asyncio.sleep(0.2)
++    s.stop()
++    assert s.status == PtySessionStatus.FINISHED
+
+diff --git a/tests/test_block_pty_session.py b/tests/test_block_pty_session.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/tests/test_block_pty_session.py
+@@ -0,0 +1,36 @@
++import pytest
++import pytest_asyncio
++
++from kmux.terminal.block_pty_session import BlockPtySession, CommandStatus, InvalidOperationError
++
++pytestmark = pytest.mark.asyncio
++
++@pytest_asyncio.fixture
++async def session():
++    s = BlockPtySession()
++    await s.start()
++    try:
++        yield s
++    finally:
++        await s.stop()
++
++async def test_session_initialized(session):
++    assert session.session_initialized is True
++    assert session.command_status in (CommandStatus.IDLE, CommandStatus.EXECUTING)
++
++async def test_execute_echo(session):
++    result = await session.execute_command("echo hello-kmux", timeout_seconds=5.0)
++    assert result.status == 'finished'
++    assert result.output is not None
++    assert "hello-kmux" in result.output
++
++async def test_snapshot_after_command(session):
++    # run a command
++    await session.execute_command("printf kmux-snap\n", timeout_seconds=5.0)
++    snap = await session.snapshot(include_all=False)
++    assert "kmux-snap" in snap
++
++async def test_send_keys_invalid_when_idle(session):
++    # When idle, send_keys should raise
++    with pytest.raises(InvalidOperationError):
++        await session.send_keys("abc")
+
+diff --git a/tests/test_terminal_server.py b/tests/test_terminal_server.py
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/tests/test_terminal_server.py
+@@ -0,0 +1,42 @@
++import asyncio
++import pytest
++import pytest_asyncio
++
++from kmux.terminal_server import TerminalServer, TerminalServerConfig
++from kmux.terminal.block_pty_session import InvalidOperationError
++
++pytestmark = pytest.mark.asyncio
++
++@pytest_asyncio.fixture
++async def server():
++    # Use default config; keep timeouts small enough for tests
++    s = TerminalServer(config=TerminalServerConfig())
++    try:
++        yield s
++    finally:
++        await s.stop()
++
++async def test_create_and_list_sessions(server: TerminalServer):
++    sid = await server.create_session()
++    assert isinstance(sid, str)
++    listed = await server.list_sessions()
++    assert sid in listed
++
++async def test_execute_and_snapshot(server: TerminalServer):
++    sid = await server.create_session()
++    out = await server.execute_command(session_id=sid, command="echo TS-hello", timeout_seconds=5.0)
++    assert "Command finished" in out
++    snap = await server.snapshot(session_id=sid, include_all=False)
++    assert "TS-hello" in snap
++
++async def test_send_keys_invalid_when_idle(server: TerminalServer):
++    sid = await server.create_session()
++    with pytest.raises(InvalidOperationError):
++        await server.send_keys(session_id=sid, keys="abc")
++
++async def test_delete_session(server: TerminalServer):
++    sid = await server.create_session()
++    await server.delete_session(session_id=sid)
++    listed = await server.list_sessions()
++    # Either no sessions, or at least the deleted id should not appear
++    assert sid not in listed
