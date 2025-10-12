@@ -278,5 +278,9 @@ class TerminalServer:
         Stops all current terminal sessions.
         """
 
-        await asyncio.gather(session_item.session.stop() for session_item in self._session_items.values())
+        await asyncio.gather(*[
+            session_item.session.stop() for session_item in self._session_items.values()
+            if session_item.session is not None
+        ])
+        self._session_items.clear()
         
