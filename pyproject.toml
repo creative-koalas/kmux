@@ -17,11 +17,9 @@ dependencies = [
 ]
 
 [dependency-groups]
- dev = [
+dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
-]
-dev = [
     "ipython>=9.5.0",
 ]
 
