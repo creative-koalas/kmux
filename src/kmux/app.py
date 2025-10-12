@@ -25,7 +25,7 @@ async def lifespan(app: FastMCP):
     await terminal_server.stop()
 
 
-mcp = FastMCP(lifespan=lifespan)
+mcp = FastMCP(lifespan=lifespan, host="0.0.0.0")
 
 @mcp.prompt(name="_plugin_general_documentation")
 async def plugin_general_documentation() -> str:
