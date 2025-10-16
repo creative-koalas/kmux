@@ -1,6 +1,9 @@
-import os, sys, asyncio, pytest
+import os, sys, asyncio, shutil, pytest
 sys.path.insert(0, os.path.abspath('src'))
 from kmux.terminal.block_pty_session import BlockPtySession
+
+zsh_available = shutil.which('zsh') is not None
+pytestmark = pytest.mark.skipif(not zsh_available, reason='zsh not available')
 
 @pytest.mark.asyncio
 async def test_block_session_detects_blocks():
