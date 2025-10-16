@@ -97,8 +97,19 @@ async def execute_command(session_id: str, command: str, timeout_seconds: float 
     :param session_id: The ID of the zsh session to execute command.
     :param command: The command to execute.
     :param timeout_seconds: The timeout in seconds for the command to execute.
+    This must be no longer than 10 seconds.
+    DO NOT set a very large timeout for a long-running command;
+    if you intend to execute a long-running (or interactive) command,
+    use a shorter timeout and let this function call return before the command finishes.
+    Later, you can check the status of the terminal session to see if the command has finished executing
+    (or interact with the command).
     """
     try:
+        if timeout_seconds > 10:
+            raise Exception("""Timeout must be no longer than 10 seconds!
+If you intend to execute a long-running command, use a shorter timeout and try again.
+This function call will likely timeout and return (but the command keeps running),
+and you can check the status of the command later.""")
         return await terminal_server.execute_command(session_id=session_id, command=command, timeout_seconds=timeout_seconds)
     except Exception as e:
         return f"""Failed to execute command. Error: "{e}"."""
