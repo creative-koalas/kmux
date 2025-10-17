@@ -119,7 +119,7 @@ async def send_keys(session_id: str, keys: str) -> str:
     """
     Sends keys to a zsh session.
     This is useful with e.g., interactive CLI tools like `vim` or `npx create-next-app@latest ...`,
-    or terminating a running command with Ctrl-C.
+    or terminating a running command with Ctrl-C (sending special characters like \x03 is supported).
     This tool is only available when there is a running command in the zsh session, presumably awaiting input.
     
     :param session_id: The ID of the zsh session to send keys.

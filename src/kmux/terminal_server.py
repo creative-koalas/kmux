@@ -181,7 +181,12 @@ class TerminalServer:
 {result.output}
 </command-output>"""
             else:
-                return f"""Command timed out after {result.timeout_seconds:.2f} seconds (i.e., still running)."""
+                return f"""Command is still running after {result.timeout_seconds:.2f} seconds;
+this could mean the command is doing blocking operations (e.g., disk reading, downloading)
+or is awaiting input (e.g., password, confirmation).
+It is recommended to use `snapshot` on this session later to see command status,
+and use `send_keys` or `enter_root_password` to interact with the command if necessary.
+You cannot execute another command on this session until the current command finishes or get terminated."""
     
     async def snapshot(self, session_id: str, include_all: bool = False) -> str:
         
