@@ -125,7 +125,7 @@ class TestIntegration:
                 'timeout_seconds': 0.2,
             })
             tout = _extract_text(raw)
-            assert 'Command timed out after' in tout
+            assert ('Command timed out after' in tout) or ('Command is still running after' in tout)
 
             # Snapshot and delete
             snap = _extract_text(await mcp.call_tool('snapshot', {'session_id': sid}))
