@@ -123,11 +123,15 @@ async def send_keys(session_id: str, keys: str) -> str:
     This tool is only available when there is a running command in the zsh session, presumably awaiting input.
     
     :param session_id: The ID of the zsh session to send keys.
-    :param keys: The keys to send.
+    :param keys: The keys to send. This string will be parsed with a Python `eval` and escape codes are supported.
+    For example, passing "koala\r" effectively simulates typing "koala" and pressing Enter,
+    and passing "\x03" effectively simulates Ctrl-C.
+    You may escape the special characters in the idiomatic way;
+    for example, passing "\\x03" sends a literal "\x03" instead of a Ctrl-C.
     """
 
     try:
-        await terminal_server.send_keys(session_id=session_id, keys=keys)
+        await terminal_server.send_keys(session_id=session_id, keys=eval(f'"{keys}"'))
         return """Keys sent to terminal session; it may take a few seconds for the running command to process them."""
     except Exception as e:
         return f"""Failed to send keys. Error: "{e}"."""
