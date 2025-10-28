@@ -204,7 +204,8 @@ class BlockPtySession:
                 
                 return CommandExecutionResult(status='finished', output=output, duration_seconds=duration, timeout_seconds=None)
             except asyncio.TimeoutError:
-                return CommandExecutionResult(status='timeout', output=None, duration_seconds=None, timeout_seconds=timeout_seconds)
+                output = self._parse_output(self._cumulative_output)[-1].output
+                return CommandExecutionResult(status='timeout', output=output, duration_seconds=None, timeout_seconds=timeout_seconds)
     
     async def snapshot(self, include_all: bool = False) -> str:
         """
@@ -321,16 +322,24 @@ class BlockPtySession:
             output_start = output.find(EXECSTART_MARKER)
             output_end = output.find(EXECEND_MARKER)
 
-            if command_start == -1 or command_end == -1 or output_start == -1 or output_end == -1:
-                # Incomplete block
+            # if command_start == -1 or command_end == -1 or output_start == -1 or output_end == -1:
+            #     # Incomplete block
+            #     break
+
+            if command_start == -1 or command_end == -1 or output_start == -1:
+                # Break on incomplete block but include the last block if it's still running
                 break
 
             command_start += len(EDITSTART_MARKER)
             output_start += len(EXECSTART_MARKER)
             
+            # assert command_start <= command_end \
+            #     and command_end <= output_start \
+            #     and output_start <= output_end, "Error: Invalid marker order!"
+
+            # Allow the case where the command is still running
             assert command_start <= command_end \
-                and command_end <= output_start \
-                and output_start <= output_end, "Error: Invalid marker order!"
+                and command_end <= output_start
 
             command = output[command_start:command_end]
             command_output = output[output_start:output_end]

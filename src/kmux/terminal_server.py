@@ -184,6 +184,13 @@ class TerminalServer:
                 return f"""Command is still running after {result.timeout_seconds:.2f} seconds;
 this could mean the command is doing blocking operations (e.g., disk reading, downloading)
 or is awaiting input (e.g., password, confirmation).
+
+Current command output:
+
+<command-output>
+{result.output}
+</command-output>
+
 It is recommended to use `snapshot` on this session later to see command status,
 and use `send_keys` or `enter_root_password` to interact with the command if necessary.
 You cannot execute another command on this session until the current command finishes or get terminated."""
