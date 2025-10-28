@@ -93,6 +93,15 @@ async def execute_command(session_id: str, command: str, timeout_seconds: float 
     """
     Executes a command in a zsh session.
     This tool is only available when the zsh session is awaiting command input.
+    It is STRONGLY DISCOURAGED to put a lot of commands in a single call to this method;
+    this can cause the command to run for an extended period of time
+    and make it harder to pinpoint what went wrong or which command is blocking, should an error occur.
+    Instead, execute one command at a time, examine the outputs, and proceed accordingly,
+    just like a human would
+    (e.g., execute `git clone...`, then execute `cd ...`, then execute `git checkout ...`, then execute `uv sync`, then execute `uv run python ...`
+    instead of putting them into a single call to this method with `git clone ...; cd ...; git checkout ...; uv sync; uv run python ...`).
+    Execute multiple commands together only when it's necessary,
+    e.g., when doing pipe operations like `ps aux | grep ...`.
     
     :param session_id: The ID of the zsh session to execute command.
     :param command: The command to execute.
