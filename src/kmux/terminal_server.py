@@ -159,7 +159,7 @@ class TerminalServer:
                 logger.warning(f'`update_session_description` timed out after {self._config.general_tool_call_timeout_seconds} seconds')
                 raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
-    async def execute_command(self, session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
+    async def submit_command(self, session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
         async with self._sessions_lock.reader:
             session_item = self._session_items.get(session_id)
 
@@ -170,20 +170,32 @@ class TerminalServer:
             tool_call_timeout = timeout_seconds + 1
             
             try:
-                result = await asyncio.wait_for(session_item.session.execute_command(command, timeout_seconds=timeout_seconds), timeout=tool_call_timeout)
+                result = await asyncio.wait_for(session_item.session.submit_command(command, timeout_seconds=timeout_seconds), timeout=tool_call_timeout)
             except asyncio.TimeoutError:
                 logger.warning(f'`BlockPtySession.execute_command` timeout after {tool_call_timeout} seconds (command execution timeout was {timeout_seconds} seconds)')
                 return f"Tool call itself timeout after {tool_call_timeout} seconds. Command may or may not have been submitted to the terminal session; consider coming back and checking this terminal session later."
 
-            if result.status == 'finished':
-                return f"""Command finished in {result.duration_seconds:.2f} seconds with the following output:
+            if result.result_type == 'finished':
+                return f"""Command finished in {result.duration_seconds:.2f} seconds.
+
+Executed command buffer:
+<command>
+{result.command_buffer}
+</command>
+
+Command output:
 <command-output>
 {result.output}
 </command-output>"""
-            else:
+            elif result.result_type == 'timeout':
                 return f"""Command is still running after {result.timeout_seconds:.2f} seconds;
 this could mean the command is doing blocking operations (e.g., disk reading, downloading)
 or is awaiting input (e.g., password, confirmation).
+
+Currently executing command buffer:
+<command>
+{result.command_buffer}
+</command>
 
 Current command output:
 
@@ -194,6 +206,16 @@ Current command output:
 It is recommended to use `snapshot` on this session later to see command status,
 and use `send_keys` or `enter_root_password` to interact with the command if necessary.
 You cannot execute another command on this session until the current command finishes or get terminated."""
+            elif result.result_type == 'command_incomplete':
+                return f"""Current command buffer is incomplete for parsing and execution;
+call `submit_command` again to complete the command and submit for execution.
+
+Current command buffer:
+
+<command>
+{result.command_buffer}
+</command>
+"""
     
     async def snapshot(self, session_id: str, include_all: bool = False) -> str:
         

@@ -89,7 +89,8 @@ async def update_session_description(session_id: str, description: str) -> str:
 
 
 @mcp.tool()
-async def execute_command(session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
+async def submit_command(session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
+    # FIXME: Update docstring
     """
     Executes a command in a zsh session.
     This tool is only available when the zsh session is awaiting command input.
@@ -119,7 +120,7 @@ async def execute_command(session_id: str, command: str, timeout_seconds: float 
 If you intend to execute a long-running command, use a shorter timeout and try again.
 This function call will likely timeout and return (but the command keeps running),
 and you can check the status of the command later.""")
-        return await terminal_server.execute_command(session_id=session_id, command=command, timeout_seconds=timeout_seconds)
+        return await terminal_server.submit_command(session_id=session_id, command=command, timeout_seconds=timeout_seconds)
     except Exception as e:
         return f"""Failed to execute command. Error: "{e}"."""
 

@@ -72,8 +72,51 @@ add-zle-hook-widget zle-line-finish kmux_line_finish
 
 class _SessionStatus(Enum):
     EXECUTING = 'executing'
-    IDLE = 'idle'
+    """A command is currently being executed; last marker is EXECSTART."""
+    AWAITING_COMMAND = 'awaiting_command'
+    """Awaiting new command; last two markers are EXECEND and EDITSTART."""
+    INPUT_COMMAND = 'input_command'
+    """Currently inputting command; last two markers are EDITEND and EDITSTART."""
+    TRANSIENT_ZSH_PROCESSING = 'parsing_command'
+    """Transient state, Zsh is currently processing; last marker is EDITEND or EXECEND"""
+    
+    _NO_MARKERS = '_no_markers'
+    """No block markers found in the output buffer; likely that the session has not received any output yet."""
+    
+    @property
+    def status_string(self) -> str:
+        if self == _SessionStatus.EXECUTING:
+            return 'executing command'
+        elif self == _SessionStatus.AWAITING_COMMAND:
+            return 'awaiting new command'
+        elif self == _SessionStatus.INPUT_COMMAND:
+            return 'awaiting additional input for current incomplete (likely multi-line) command'
+        elif self == _SessionStatus.TRANSIENT_ZSH_PROCESSING:
+            return 'waiting for Zsh bookkeeping work to complete (should finish automatically shortly)'
+        else:
+            raise RuntimeError(f'Error: Invalid session status: {self}')
 
+
+def _extract_markers(cumulative_output: bytes) -> list[_BlockMarker]:
+    """
+    Extracts the markers from the cumulative buffer and returns them in order.
+
+    :param cumulative_output: The cumulative output from the pty session.
+    :return: The markers in order.
+    """
+
+    matches = set()
+
+    for marker in _BlockMarker:
+        start = 0
+        
+        while (index := cumulative_output.find(marker.value, start)) != -1:
+            matches.add((index, marker))
+            start = index + len(marker.value)
+    
+    matches = [x[1] for x in sorted(matches, key=lambda x: x[0])]
+
+    return matches
 
 class InvalidOperationError(Exception):
     """Raised when an invalid operation is performed."""
@@ -82,16 +125,33 @@ class InvalidOperationError(Exception):
         super().__init__(message)
 
 
-class CommandExecutionResult(BaseModel):
-    status: Literal['finished', 'timeout']
+class CommandSubmissionResult(BaseModel):
+    result_type: Literal['finished', 'timeout', 'command_incomplete']
+    """
+    The type of the command submission result.
+    
+    - finished: Command finished executing and exited.
+    - timeout: Command did not exit within the specified timeout.
+    - command_incomplete: Submitted command is incomplete (likely multi-line);
+    more input is required before command buffer can be parsed.
+    """
     output: str | None
+    """The command output (applies only to `finished` and `timeout` result)"""
+    command_buffer: str | None
+    """The current incomplete command buffer (applies only to `finished`, `timeout` and `command_incomplete` result)"""
     duration_seconds: float | None = None
+    """The time it took to execute the command (applies only to `finished` result)"""
     timeout_seconds: float | None = None
+    """The timeout duration (applies only to `timeout` result)"""
 
 
-class CommandBlock(BaseModel):
-    command: str
-    output: str
+class _CommandBlock(BaseModel):
+    command_parts: list[bytes]
+    output: str | None
+
+    @property
+    def combined_command(self) -> bytes:
+        return b''.join(self.command_parts)
 
 
 class _ParseState(Enum):
@@ -141,22 +201,19 @@ class BlockPtySession:
         self._cumulative_output: bytes = b''
         self._root_password = root_password
         self._tool_lock = asyncio.Lock()
-        self._current_command_finish_execution_event = asyncio.Event()
+        self._session_idle_event = asyncio.Event()
         self._session_finished_event = asyncio.Event()
         self._on_session_finished_callback = on_session_finished_callback
         self._watch_session_finished_task: asyncio.Task
 
         self._session_initialized = False
 
+        # FIXME: Remove this
         self._current_command: str | None = None
 
     @property
     def session_status(self) -> PtySessionStatus:
         return self._pty_session.status
-    
-    @property
-    def command_status(self) -> _SessionStatus:
-        return self._get_command_status(self._cumulative_output)
     
     @property
     def session_initialized(self) -> bool:
@@ -180,7 +237,7 @@ class BlockPtySession:
 
     async def enter_root_password(self):
         async with self._tool_lock:
-            if self._get_command_status(self._cumulative_output) != _SessionStatus.EXECUTING:
+            if self._get_session_status(self._cumulative_output) != _SessionStatus.EXECUTING:
                 raise InvalidOperationError("This method is available only when a command is running, presumably awaiting password input!")
             if self._root_password is None:
                 raise ValueError("Root privilege not enabled on this zsh session!")
@@ -188,17 +245,22 @@ class BlockPtySession:
 
     async def send_keys(self, keys: str):
         async with self._tool_lock:
-            if self._get_command_status(self._cumulative_output) != _SessionStatus.EXECUTING:
+            if self._get_session_status(self._cumulative_output) != _SessionStatus.EXECUTING:
                 raise InvalidOperationError("This method is available only when a command is running!")
             await self._pty_session.write_bytes(keys.encode())
 
-    async def execute_command(self, command: str, timeout_seconds: float = 5.0) -> CommandExecutionResult:
+    async def submit_command(self, command: str, timeout_seconds: float = 5.0) -> CommandSubmissionResult:
         async with self._tool_lock:
-            if self._get_command_status(self._cumulative_output) != _SessionStatus.IDLE:
-                raise InvalidOperationError("This method is available only when the zsh session is awaiting command input; right now there is still a command running.")
+            session_status = self._get_session_status(self._cumulative_output)
+            if session_status not in { _SessionStatus.AWAITING_COMMAND, _SessionStatus.INPUT_COMMAND }:
+                raise InvalidOperationError(
+                    "This method is available only when the zsh session is awaiting command input; "
+                    f"right now the session is {session_status.status_string}."
+                )
 
-            self._current_command_finish_execution_event.clear()
-            await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
+            self._session_idle_event.clear()
+            # TODO: Remove this clear junk line?
+            # await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
             start_time = datetime.now(UTC)
             
             # Use bracketed paste mode to ensure correct behavior when command contains multiple commands
@@ -207,16 +269,43 @@ class BlockPtySession:
             self._current_command = command
 
             try:
-                await asyncio.wait_for(self._current_command_finish_execution_event.wait(), timeout=timeout_seconds)
+                await asyncio.wait_for(self._session_idle_event.wait(), timeout=timeout_seconds)
                 end_time = datetime.now(UTC)
                 duration = (end_time - start_time).total_seconds()
 
-                output = self._parse_output(self._cumulative_output)[-1].output
-                
-                return CommandExecutionResult(status='finished', output=output, duration_seconds=duration, timeout_seconds=None)
+                last_block = self._parse_output(self._cumulative_output)[-1]
+
+                if last_block.output is None:
+                    # Incomplete command; command is not executed
+                    return CommandSubmissionResult(
+                        result_type='command_incomplete',
+                        output=None,
+                        command_buffer=self._render(last_block.combined_command),
+                        duration_seconds=duration,
+                        timeout_seconds=None
+                    )
+                else:
+                    # Command successfully submitted and sent for execution
+                    # TODO: Could there be a case where `last_block.output` is not `None` but the command has not finished executing?
+                    return CommandSubmissionResult(
+                        result_type='finished',
+                        output=last_block.output,
+                        command_buffer=self._render(last_block.combined_command),
+                        duration_seconds=duration,
+                        timeout_seconds=None
+                    )
             except asyncio.TimeoutError:
-                output = self._parse_output(self._cumulative_output)[-1].output
-                return CommandExecutionResult(status='timeout', output=output, duration_seconds=None, timeout_seconds=timeout_seconds)
+                # Command timed out
+                # TODO: Does it work for the case where it's the parsing by Zsh that timed out?
+                last_block = self._parse_output(self._cumulative_output)[-1]
+                
+                return CommandSubmissionResult(
+                    result_type='timeout',
+                    output=last_block.output,
+                    command_buffer=self._render(last_block.combined_command),
+                    duration_seconds=None,
+                    timeout_seconds=timeout_seconds
+                )
     
     async def snapshot(self, include_all: bool = False) -> str:
         """
@@ -230,26 +319,29 @@ class BlockPtySession:
         if include_all:
             return self._render(cumulative_output)
         
-        current_output = cumulative_output
+        command_status = self._get_session_status(cumulative_output)
         
-        command_status = self._get_command_status(current_output)
+        # TODO: Did we handle all the possible cases gracefully?
         if command_status == _SessionStatus.EXECUTING:
-            last_exec_end_index = current_output.rfind(_BlockMarker.EXEC_END.value)
+            # There's a command currently executing
+            last_exec_end_index = cumulative_output.rfind(_BlockMarker.EXEC_END.value)
             return self._render(
-                current_output[
+                cumulative_output[
                     last_exec_end_index + len(_BlockMarker.EXEC_END.value) if last_exec_end_index != -1 else 0:
                 ]
             )
-        elif command_status == _SessionStatus.IDLE:
-            # Find the second to last EDITSTART marker
-            second_to_last_exec_end_index = current_output.rfind(_BlockMarker.EXEC_END.value, 0, current_output.rfind(_BlockMarker.EXEC_END.value))
-            return self._render(
-                current_output[
-                    second_to_last_exec_end_index + len(_BlockMarker.EXEC_END.value) if second_to_last_exec_end_index != -1 else 0:
-                ]
-            )
         else:
-            raise Exception(f'Invalid command status: {command_status}')
+            # Render everything after the second-to-last EXEC_END marker
+            last_exec_end_index = cumulative_output.rfind(_BlockMarker.EXEC_END.value)
+            if last_exec_end_index == -1:
+                last_exec_end_index = len(cumulative_output)
+            render_start = cumulative_output.rfind(_BlockMarker.EXEC_END.value, 0, last_exec_end_index)
+            if render_start == -1:
+                render_start = 0
+            else:
+                render_start += len(_BlockMarker.EXEC_END.value)
+            
+            return self._render(cumulative_output[render_start:])
     
     def get_current_running_command(self) -> str | None:
         """
@@ -261,7 +353,7 @@ class BlockPtySession:
         # Finds the currently running command.
         current_output = self._cumulative_output
         
-        if self._get_command_status(current_output) != _SessionStatus.EXECUTING:
+        if self._get_session_status(current_output) != _SessionStatus.EXECUTING:
             return None
         
         # TODO: Well, we just can't seem to get the bytes between edit start & end markers to render correctly,.
@@ -307,28 +399,51 @@ class BlockPtySession:
         old_cumulative_output = self._cumulative_output
         self._cumulative_output += data
 
-        # Wake execution waiter when command execution finishes
-        if self._get_command_status(old_cumulative_output) == _SessionStatus.EXECUTING \
-            and self._get_command_status(self._cumulative_output) == _SessionStatus.IDLE:
-            self._current_command_finish_execution_event.set()
+        # Wake terminal idle waiters when terminal becomes idle
+        if (not self._is_session_idle(old_cumulative_output)) \
+            and self._is_session_idle(self._cumulative_output):
+            self._session_idle_event.set()
+    
+    @staticmethod
+    def _is_session_idle(cumulative_output: bytes) -> _SessionStatus:
+        # _NO_MARKERS is considered "not idle", since the session is not ready to accept inputs at this point;
+        # this is the expected design choice.
+        return BlockPtySession._get_session_status(cumulative_output) in { _SessionStatus.AWAITING_COMMAND, _SessionStatus.INPUT_COMMAND }
 
-    def _get_command_status(self, cumulative_output: bytes) -> _SessionStatus:
-        # Look for all markers; if EDITSTART is the last marker, it's idle.
-        last_edit_start_index = cumulative_output.rfind(_BlockMarker.EDIT_START.value)
-        last_edit_end_index = cumulative_output.rfind(_BlockMarker.EDIT_END.value)
-        last_exec_start_index = cumulative_output.rfind(_BlockMarker.EXEC_START.value)
-        last_exec_end_index   = cumulative_output.rfind(_BlockMarker.EXEC_END.value)
-
-        if last_edit_start_index == max(last_edit_start_index, last_edit_end_index, last_exec_start_index, last_exec_end_index):
-            return _SessionStatus.IDLE
+    @staticmethod
+    def _get_session_status(cumulative_output: bytes) -> _SessionStatus:
+        markers = _extract_markers(cumulative_output)
+        
+        if len(markers) >= 2:
+            last_markers = (markers[-2], markers[-1])
+        elif len(markers) >= 1:
+            last_markers = (None, markers[-1])
         else:
+            last_markers = (None, None)
+        
+        if last_markers == (None, None):
+            return _SessionStatus._NO_MARKERS
+        
+        if last_markers[-1] == _BlockMarker.EXEC_START:
             return _SessionStatus.EXECUTING
+        elif last_markers == (_BlockMarker.EXEC_END, _BlockMarker.EDIT_START) \
+            or last_markers == (None, _BlockMarker.EDIT_START):
+            return _SessionStatus.AWAITING_COMMAND
+        elif last_markers == (_BlockMarker.EDIT_END, _BlockMarker.EDIT_START):
+            return _SessionStatus.INPUT_COMMAND
+        elif last_markers[-1] in { _BlockMarker.EDIT_END, _BlockMarker.EXEC_END }:
+            return _SessionStatus.TRANSIENT_ZSH_PROCESSING
+        else:
+            error_message = f'Potential bug: unexpected state, last two markers are {last_markers}'
+            logger.error(error_message)
+            
+            raise RuntimeError(error_message)
 
-    def _parse_output(self, output: bytes) -> list[CommandBlock]:
-        blocks: list[CommandBlock] = []
+    def _parse_output(self, output: bytes) -> list[_CommandBlock]:
+        blocks: list[_CommandBlock] = []
         cursor = 0
         state = _ParseState.WAIT_EDIT_START
-        command_bytes: bytes | None = None
+        command_parts: list[bytes] = []
         iteration = 0
 
         while cursor < len(output):
@@ -357,12 +472,12 @@ class BlockPtySession:
                 assert next_exec_start == -1 or next_exec_start >= edit_end, "Detected EXECSTART before EDITEND"
                 assert next_exec_end == -1 or next_exec_end >= edit_end, "Detected EXECEND before EDITEND"
 
-                command_bytes = output[cursor:edit_end]
+                command_parts.append(output[cursor:edit_end])
                 cursor = edit_end + len(_BlockMarker.EDIT_END.value)
                 state = _ParseState.WAIT_EXEC_START_OR_NEXT_EDIT
 
             elif state == _ParseState.WAIT_EXEC_START_OR_NEXT_EDIT:
-                assert command_bytes is not None, "command_bytes must be set before seeking EXECSTART"
+                assert len(command_parts) > 0, "There must be command input before seeking EXECSTART"
                 exec_start = output.find(_BlockMarker.EXEC_START.value, cursor)
                 next_edit_start = output.find(_BlockMarker.EDIT_START.value, cursor)
 
@@ -371,26 +486,18 @@ class BlockPtySession:
                     break
 
                 elif next_edit_start != -1 and (exec_start == -1 or next_edit_start < exec_start):
-                    # Command failed before execution; capture everything up to the next EDITSTART.
-                    command_output = output[cursor:next_edit_start]
-                    blocks.append(
-                        CommandBlock(
-                            command=self._render(command_bytes),
-                            output=self._render(command_output),
-                        )
-                    )
-                    command_bytes = None
+                    # Next marker is EDIT_START; this is a multi-part command
                     cursor = next_edit_start
                     state = _ParseState.WAIT_EDIT_START
                 elif exec_start != -1 and (next_edit_start == -1 or exec_start < next_edit_start):
-                    # Command parsed successfully
+                    # Next marker is EXEC_START
                     cursor = exec_start + len(_BlockMarker.EXEC_START.value)
                     state = _ParseState.WAIT_EXEC_END
                 else:
                     raise RuntimeError(f'Invalid state transition: exec_start={exec_start}, next_edit_start={next_edit_start}')
 
             elif state == _ParseState.WAIT_EXEC_END:
-                assert command_bytes is not None, "command_bytes must be set before capturing EXEC output"
+                assert len(command_parts) > 0, "There must be command input before capturing EXEC output"
                 exec_end = output.find(_BlockMarker.EXEC_END.value, cursor)
                 if exec_end == -1:
                     break
@@ -404,17 +511,40 @@ class BlockPtySession:
 
                 command_output = output[cursor:exec_end]
                 blocks.append(
-                    CommandBlock(
-                        command=self._render(command_bytes),
+                    _CommandBlock(
+                        command_parts=command_parts,
                         output=self._render(command_output),
                     )
                 )
-                command_bytes = None
+                
+                # This marks the end of this command-output pair; clear command parts
+                command_parts = []
                 cursor = exec_end + len(_BlockMarker.EXEC_END.value)
                 state = _ParseState.WAIT_EDIT_START
 
             else:
                 raise RuntimeError(f"Unknown parse state: {state}")
+        
+        if state == _ParseState.WAIT_EDIT_END:
+            # Waiting for edit end; currently entering command (includes carrying on from a previous incomplete command)
+            if len(command_parts) > 0:
+                # Currently awaiting additional input from an incomplete command;
+                # Add that command as a block
+                blocks.append(
+                    _CommandBlock(
+                        command_parts=command_parts,
+                        output=None
+                    )
+                )
+        elif state == _ParseState.WAIT_EXEC_END:
+            # Waiting for completion of a currently running command;
+            # Add that command as a block
+            blocks.append(
+                _CommandBlock(
+                    command_parts=command_parts,
+                    output=self._render(output[cursor:])
+                )
+            )
 
         return blocks
 
