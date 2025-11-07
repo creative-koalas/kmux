@@ -12,11 +12,15 @@ from .utils import render_bytes
 
 logger = logging.getLogger()
 
+
 # === Markers injected by zsh hooks ===
-EDITSTART_MARKER = b'\x1bPkmux;EDITSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
-EDITEND_MARKER   = b'\x1bPkmux;EDITEND;1b3e62c774b44f78898be928a7aa6532\x1b\\'
-EXECSTART_MARKER = b'\x1bPkmux;EXECSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
-EXECEND_MARKER   = b'\x1bPkmux;EXECEND;1b3e62c774b44f78898be928a7aa6532\x1b\\'
+class _BlockMarker(Enum):
+    EDIT_START = b'\x1bPkmux;EDITSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
+    EDIT_END   = b'\x1bPkmux;EDITEND;1b3e62c774b44f78898be928a7aa6532\x1b\\'
+    EXEC_START = b'\x1bPkmux;EXECSTART;1b3e62c774b44f78898be928a7aa6532\x1b\\'
+    EXEC_END   = b'\x1bPkmux;EXECEND;1b3e62c774b44f78898be928a7aa6532\x1b\\'
+
+
 EDIT_START_BRACKET_CODE = b'\x1b[200~'
 EDIT_END_BRACKET_CODE = b'\x1b[201~'
 
@@ -66,7 +70,7 @@ add-zle-hook-widget zle-line-finish kmux_line_finish
 """
 
 
-class CommandStatus(Enum):
+class _SessionStatus(Enum):
     EXECUTING = 'executing'
     IDLE = 'idle'
 
@@ -151,7 +155,7 @@ class BlockPtySession:
         return self._pty_session.status
     
     @property
-    def command_status(self) -> CommandStatus:
+    def command_status(self) -> _SessionStatus:
         return self._get_command_status(self._cumulative_output)
     
     @property
@@ -176,7 +180,7 @@ class BlockPtySession:
 
     async def enter_root_password(self):
         async with self._tool_lock:
-            if self._get_command_status(self._cumulative_output) != CommandStatus.EXECUTING:
+            if self._get_command_status(self._cumulative_output) != _SessionStatus.EXECUTING:
                 raise InvalidOperationError("This method is available only when a command is running, presumably awaiting password input!")
             if self._root_password is None:
                 raise ValueError("Root privilege not enabled on this zsh session!")
@@ -184,13 +188,13 @@ class BlockPtySession:
 
     async def send_keys(self, keys: str):
         async with self._tool_lock:
-            if self._get_command_status(self._cumulative_output) != CommandStatus.EXECUTING:
+            if self._get_command_status(self._cumulative_output) != _SessionStatus.EXECUTING:
                 raise InvalidOperationError("This method is available only when a command is running!")
             await self._pty_session.write_bytes(keys.encode())
 
     async def execute_command(self, command: str, timeout_seconds: float = 5.0) -> CommandExecutionResult:
         async with self._tool_lock:
-            if self._get_command_status(self._cumulative_output) != CommandStatus.IDLE:
+            if self._get_command_status(self._cumulative_output) != _SessionStatus.IDLE:
                 raise InvalidOperationError("This method is available only when the zsh session is awaiting command input; right now there is still a command running.")
 
             self._current_command_finish_execution_event.clear()
@@ -229,19 +233,19 @@ class BlockPtySession:
         current_output = cumulative_output
         
         command_status = self._get_command_status(current_output)
-        if command_status == CommandStatus.EXECUTING:
-            last_exec_end_index = current_output.rfind(EXECEND_MARKER)
+        if command_status == _SessionStatus.EXECUTING:
+            last_exec_end_index = current_output.rfind(_BlockMarker.EXEC_END.value)
             return self._render(
                 current_output[
-                    last_exec_end_index + len(EXECEND_MARKER) if last_exec_end_index != -1 else 0:
+                    last_exec_end_index + len(_BlockMarker.EXEC_END.value) if last_exec_end_index != -1 else 0:
                 ]
             )
-        elif command_status == CommandStatus.IDLE:
+        elif command_status == _SessionStatus.IDLE:
             # Find the second to last EDITSTART marker
-            second_to_last_exec_end_index = current_output.rfind(EXECEND_MARKER, 0, current_output.rfind(EXECEND_MARKER))
+            second_to_last_exec_end_index = current_output.rfind(_BlockMarker.EXEC_END.value, 0, current_output.rfind(_BlockMarker.EXEC_END.value))
             return self._render(
                 current_output[
-                    second_to_last_exec_end_index + len(EXECEND_MARKER) if second_to_last_exec_end_index != -1 else 0:
+                    second_to_last_exec_end_index + len(_BlockMarker.EXEC_END.value) if second_to_last_exec_end_index != -1 else 0:
                 ]
             )
         else:
@@ -257,7 +261,7 @@ class BlockPtySession:
         # Finds the currently running command.
         current_output = self._cumulative_output
         
-        if self._get_command_status(current_output) != CommandStatus.EXECUTING:
+        if self._get_command_status(current_output) != _SessionStatus.EXECUTING:
             return None
         
         # TODO: Well, we just can't seem to get the bytes between edit start & end markers to render correctly,.
@@ -267,8 +271,8 @@ class BlockPtySession:
         # this method should work fine in most cases.
         return self._current_command
         
-        # command_start = current_output.rfind(EDITSTART_MARKER) + len(EDITSTART_MARKER)
-        # command_end = current_output.rfind(EDITEND_MARKER)
+        # command_start = current_output.rfind(_BlockMarker.EDIT_START.value) + len(_BlockMarker.EDIT_START.value)
+        # command_end = current_output.rfind(_BlockMarker.EDIT_END.value)
 
         # return self._render(current_output[command_start:command_end])
     
@@ -289,10 +293,10 @@ class BlockPtySession:
         # Right now we're instantiating a new pyte.HistoryScreen each time we call this method.
         
         data = data \
-            .replace(EDITSTART_MARKER, b'') \
-            .replace(EDITEND_MARKER, b'') \
-            .replace(EXECSTART_MARKER, b'') \
-            .replace(EXECEND_MARKER, b'')
+            .replace(_BlockMarker.EDIT_START.value, b'') \
+            .replace(_BlockMarker.EDIT_END.value, b'') \
+            .replace(_BlockMarker.EXEC_START.value, b'') \
+            .replace(_BlockMarker.EXEC_END.value, b'')
         
         content = '\n'.join(s.rstrip() for s in render_bytes(data, screen_width=self._screen_width, screen_height=self._screen_height))
 
@@ -304,21 +308,21 @@ class BlockPtySession:
         self._cumulative_output += data
 
         # Wake execution waiter when command execution finishes
-        if self._get_command_status(old_cumulative_output) == CommandStatus.EXECUTING \
-            and self._get_command_status(self._cumulative_output) == CommandStatus.IDLE:
+        if self._get_command_status(old_cumulative_output) == _SessionStatus.EXECUTING \
+            and self._get_command_status(self._cumulative_output) == _SessionStatus.IDLE:
             self._current_command_finish_execution_event.set()
 
-    def _get_command_status(self, cumulative_output: bytes) -> CommandStatus:
+    def _get_command_status(self, cumulative_output: bytes) -> _SessionStatus:
         # Look for all markers; if EDITSTART is the last marker, it's idle.
-        last_edit_start_index = cumulative_output.rfind(EDITSTART_MARKER)
-        last_edit_end_index = cumulative_output.rfind(EDITEND_MARKER)
-        last_exec_start_index = cumulative_output.rfind(EXECSTART_MARKER)
-        last_exec_end_index   = cumulative_output.rfind(EXECEND_MARKER)
+        last_edit_start_index = cumulative_output.rfind(_BlockMarker.EDIT_START.value)
+        last_edit_end_index = cumulative_output.rfind(_BlockMarker.EDIT_END.value)
+        last_exec_start_index = cumulative_output.rfind(_BlockMarker.EXEC_START.value)
+        last_exec_end_index   = cumulative_output.rfind(_BlockMarker.EXEC_END.value)
 
         if last_edit_start_index == max(last_edit_start_index, last_edit_end_index, last_exec_start_index, last_exec_end_index):
-            return CommandStatus.IDLE
+            return _SessionStatus.IDLE
         else:
-            return CommandStatus.EXECUTING
+            return _SessionStatus.EXECUTING
 
     def _parse_output(self, output: bytes) -> list[CommandBlock]:
         blocks: list[CommandBlock] = []
@@ -334,33 +338,33 @@ class BlockPtySession:
             logger.debug(f"_parse_output iter={iteration}: state={state}, cursor={cursor}")
 
             if state == _ParseState.WAIT_EDIT_START:
-                edit_start = output.find(EDITSTART_MARKER, cursor)
+                edit_start = output.find(_BlockMarker.EDIT_START.value, cursor)
                 if edit_start == -1:
                     break
 
-                cursor = edit_start + len(EDITSTART_MARKER)
+                cursor = edit_start + len(_BlockMarker.EDIT_START.value)
                 state = _ParseState.WAIT_EDIT_END
 
             elif state == _ParseState.WAIT_EDIT_END:
-                edit_end = output.find(EDITEND_MARKER, cursor)
+                edit_end = output.find(_BlockMarker.EDIT_END.value, cursor)
                 if edit_end == -1:
                     break
 
-                next_edit_start = output.find(EDITSTART_MARKER, cursor)
-                next_exec_start = output.find(EXECSTART_MARKER, cursor)
-                next_exec_end = output.find(EXECEND_MARKER, cursor)
+                next_edit_start = output.find(_BlockMarker.EDIT_START.value, cursor)
+                next_exec_start = output.find(_BlockMarker.EXEC_START.value, cursor)
+                next_exec_end = output.find(_BlockMarker.EXEC_END.value, cursor)
                 assert next_edit_start == -1 or next_edit_start >= edit_end, "Detected nested EDITSTART before EDITEND"
                 assert next_exec_start == -1 or next_exec_start >= edit_end, "Detected EXECSTART before EDITEND"
                 assert next_exec_end == -1 or next_exec_end >= edit_end, "Detected EXECEND before EDITEND"
 
                 command_bytes = output[cursor:edit_end]
-                cursor = edit_end + len(EDITEND_MARKER)
+                cursor = edit_end + len(_BlockMarker.EDIT_END.value)
                 state = _ParseState.WAIT_EXEC_START_OR_NEXT_EDIT
 
             elif state == _ParseState.WAIT_EXEC_START_OR_NEXT_EDIT:
                 assert command_bytes is not None, "command_bytes must be set before seeking EXECSTART"
-                exec_start = output.find(EXECSTART_MARKER, cursor)
-                next_edit_start = output.find(EDITSTART_MARKER, cursor)
+                exec_start = output.find(_BlockMarker.EXEC_START.value, cursor)
+                next_edit_start = output.find(_BlockMarker.EDIT_START.value, cursor)
 
                 if exec_start == -1 and next_edit_start == -1:
                     # Need more data to determine outcome.
@@ -380,20 +384,20 @@ class BlockPtySession:
                     state = _ParseState.WAIT_EDIT_START
                 elif exec_start != -1 and (next_edit_start == -1 or exec_start < next_edit_start):
                     # Command parsed successfully
-                    cursor = exec_start + len(EXECSTART_MARKER)
+                    cursor = exec_start + len(_BlockMarker.EXEC_START.value)
                     state = _ParseState.WAIT_EXEC_END
                 else:
                     raise RuntimeError(f'Invalid state transition: exec_start={exec_start}, next_edit_start={next_edit_start}')
 
             elif state == _ParseState.WAIT_EXEC_END:
                 assert command_bytes is not None, "command_bytes must be set before capturing EXEC output"
-                exec_end = output.find(EXECEND_MARKER, cursor)
+                exec_end = output.find(_BlockMarker.EXEC_END.value, cursor)
                 if exec_end == -1:
                     break
 
-                next_edit_start = output.find(EDITSTART_MARKER, cursor)
-                next_edit_end = output.find(EDITEND_MARKER, cursor)
-                next_exec_start = output.find(EXECSTART_MARKER, cursor)
+                next_edit_start = output.find(_BlockMarker.EDIT_START.value, cursor)
+                next_edit_end = output.find(_BlockMarker.EDIT_END.value, cursor)
+                next_exec_start = output.find(_BlockMarker.EXEC_START.value, cursor)
                 assert next_edit_start == -1 or next_edit_start >= exec_end, "Detected EDITSTART before EXECEND"
                 assert next_edit_end == -1 or next_edit_end >= exec_end, "Detected EDITEND before EXECEND"
                 assert next_exec_start == -1 or next_exec_start >= exec_end, "Detected nested EXECSTART before EXECEND"
@@ -406,7 +410,7 @@ class BlockPtySession:
                     )
                 )
                 command_bytes = None
-                cursor = exec_end + len(EXECEND_MARKER)
+                cursor = exec_end + len(_BlockMarker.EXEC_END.value)
                 state = _ParseState.WAIT_EDIT_START
 
             else:
