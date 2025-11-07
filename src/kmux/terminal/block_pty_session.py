@@ -90,6 +90,13 @@ class CommandBlock(BaseModel):
     output: str
 
 
+class _ParseState(Enum):
+    WAIT_EDIT_START = 'wait_edit_start'
+    WAIT_EDIT_END = 'wait_edit_end'
+    WAIT_EXEC_START_OR_NEXT_EDIT = 'wait_exec_start_or_next_edit'
+    WAIT_EXEC_END = 'wait_exec_end'
+
+
 class BlockPtySession:
     """
     A pty session with strict block recognition support.
@@ -315,43 +322,95 @@ class BlockPtySession:
 
     def _parse_output(self, output: bytes) -> list[CommandBlock]:
         blocks: list[CommandBlock] = []
-        
-        while True:
-            command_start = output.find(EDITSTART_MARKER)
-            command_end = output.find(EDITEND_MARKER)
-            output_start = output.find(EXECSTART_MARKER)
-            output_end = output.find(EXECEND_MARKER)
+        cursor = 0
+        state = _ParseState.WAIT_EDIT_START
+        command_bytes: bytes | None = None
+        iteration = 0
 
-            # if command_start == -1 or command_end == -1 or output_start == -1 or output_end == -1:
-            #     # Incomplete block
-            #     break
+        while cursor < len(output):
+            iteration += 1
 
-            if command_start == -1 or command_end == -1 or output_start == -1:
-                # Break on incomplete block but include the last block if it's still running
-                break
+            # FIXME: Remove this after we confirm that _parse_output works correctly
+            logger.debug(f"_parse_output iter={iteration}: state={state}, cursor={cursor}")
 
-            command_start += len(EDITSTART_MARKER)
-            output_start += len(EXECSTART_MARKER)
-            
-            # assert command_start <= command_end \
-            #     and command_end <= output_start \
-            #     and output_start <= output_end, "Error: Invalid marker order!"
+            if state == _ParseState.WAIT_EDIT_START:
+                edit_start = output.find(EDITSTART_MARKER, cursor)
+                if edit_start == -1:
+                    break
 
-            # Allow the case where the command is still running
-            assert command_start <= command_end \
-                and command_end <= output_start
+                cursor = edit_start + len(EDITSTART_MARKER)
+                state = _ParseState.WAIT_EDIT_END
 
-            command = output[command_start:command_end]
-            command_output = output[output_start:output_end]
+            elif state == _ParseState.WAIT_EDIT_END:
+                edit_end = output.find(EDITEND_MARKER, cursor)
+                if edit_end == -1:
+                    break
 
-            output = output[output_end + len(EXECEND_MARKER):]
+                next_edit_start = output.find(EDITSTART_MARKER, cursor)
+                next_exec_start = output.find(EXECSTART_MARKER, cursor)
+                next_exec_end = output.find(EXECEND_MARKER, cursor)
+                assert next_edit_start == -1 or next_edit_start >= edit_end, "Detected nested EDITSTART before EDITEND"
+                assert next_exec_start == -1 or next_exec_start >= edit_end, "Detected EXECSTART before EDITEND"
+                assert next_exec_end == -1 or next_exec_end >= edit_end, "Detected EXECEND before EDITEND"
 
-            blocks.append(
-                CommandBlock(
-                    command=self._render(command),
-                    output=self._render(command_output),
+                command_bytes = output[cursor:edit_end]
+                cursor = edit_end + len(EDITEND_MARKER)
+                state = _ParseState.WAIT_EXEC_START_OR_NEXT_EDIT
+
+            elif state == _ParseState.WAIT_EXEC_START_OR_NEXT_EDIT:
+                assert command_bytes is not None, "command_bytes must be set before seeking EXECSTART"
+                exec_start = output.find(EXECSTART_MARKER, cursor)
+                next_edit_start = output.find(EDITSTART_MARKER, cursor)
+
+                if exec_start == -1 and next_edit_start == -1:
+                    # Need more data to determine outcome.
+                    break
+
+                elif next_edit_start != -1 and (exec_start == -1 or next_edit_start < exec_start):
+                    # Command failed before execution; capture everything up to the next EDITSTART.
+                    command_output = output[cursor:next_edit_start]
+                    blocks.append(
+                        CommandBlock(
+                            command=self._render(command_bytes),
+                            output=self._render(command_output),
+                        )
+                    )
+                    command_bytes = None
+                    cursor = next_edit_start
+                    state = _ParseState.WAIT_EDIT_START
+                elif exec_start != -1 and (next_edit_start == -1 or exec_start < next_edit_start):
+                    # Command parsed successfully
+                    cursor = exec_start + len(EXECSTART_MARKER)
+                    state = _ParseState.WAIT_EXEC_END
+                else:
+                    raise RuntimeError(f'Invalid state transition: exec_start={exec_start}, next_edit_start={next_edit_start}')
+
+            elif state == _ParseState.WAIT_EXEC_END:
+                assert command_bytes is not None, "command_bytes must be set before capturing EXEC output"
+                exec_end = output.find(EXECEND_MARKER, cursor)
+                if exec_end == -1:
+                    break
+
+                next_edit_start = output.find(EDITSTART_MARKER, cursor)
+                next_edit_end = output.find(EDITEND_MARKER, cursor)
+                next_exec_start = output.find(EXECSTART_MARKER, cursor)
+                assert next_edit_start == -1 or next_edit_start >= exec_end, "Detected EDITSTART before EXECEND"
+                assert next_edit_end == -1 or next_edit_end >= exec_end, "Detected EDITEND before EXECEND"
+                assert next_exec_start == -1 or next_exec_start >= exec_end, "Detected nested EXECSTART before EXECEND"
+
+                command_output = output[cursor:exec_end]
+                blocks.append(
+                    CommandBlock(
+                        command=self._render(command_bytes),
+                        output=self._render(command_output),
+                    )
                 )
-            )
+                command_bytes = None
+                cursor = exec_end + len(EXECEND_MARKER)
+                state = _ParseState.WAIT_EDIT_START
+
+            else:
+                raise RuntimeError(f"Unknown parse state: {state}")
 
         return blocks
 
