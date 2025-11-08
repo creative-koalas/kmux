@@ -209,7 +209,7 @@ class BlockPtySession:
         self._session_initialized = False
 
         # FIXME: Remove this
-        self._current_command: str | None = None
+        self._current_command_parts: list[str] | None = None
 
     @property
     def session_status(self) -> PtySessionStatus:
@@ -257,10 +257,19 @@ class BlockPtySession:
                     "This method is available only when the zsh session is awaiting command input; "
                     f"right now the session is {session_status.status_string}."
                 )
+                
+            if session_status == _SessionStatus.AWAITING_COMMAND:
+                assert self._current_command_parts is None, "Potential bug: session state is AWAITING_COMMAND but `current_command_parts` is not None"
+                self._current_command_parts = [command]
+            elif session_status == _SessionStatus.INPUT_COMMAND:
+                assert len(self._current_command_parts) > 0, "Potential bug: session state is INPUT_COMMAND but `current_command_parts` is empty"
+                self._current_command_parts.append(command)
+            
+            combined_command_buffer = '\n'.join(self._current_command_parts)
 
             self._session_idle_event.clear()
             # TODO: Remove this clear junk line?
-            # await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
+            await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
             start_time = datetime.now(UTC)
             
             # Use bracketed paste mode to ensure correct behavior when command contains multiple commands
@@ -280,7 +289,7 @@ class BlockPtySession:
                     return CommandSubmissionResult(
                         result_type='command_incomplete',
                         output=None,
-                        command_buffer=self._render(last_block.combined_command),
+                        command_buffer=combined_command_buffer,
                         duration_seconds=duration,
                         timeout_seconds=None
                     )
@@ -290,7 +299,7 @@ class BlockPtySession:
                     return CommandSubmissionResult(
                         result_type='finished',
                         output=last_block.output,
-                        command_buffer=self._render(last_block.combined_command),
+                        command_buffer=combined_command_buffer,
                         duration_seconds=duration,
                         timeout_seconds=None
                     )
@@ -302,7 +311,7 @@ class BlockPtySession:
                 return CommandSubmissionResult(
                     result_type='timeout',
                     output=last_block.output,
-                    command_buffer=self._render(last_block.combined_command),
+                    command_buffer=combined_command_buffer,
                     duration_seconds=None,
                     timeout_seconds=timeout_seconds
                 )
@@ -350,23 +359,19 @@ class BlockPtySession:
         :return: The currently running command, or None if no command is running.
         """
 
-        # Finds the currently running command.
-        current_output = self._cumulative_output
-        
-        if self._get_session_status(current_output) != _SessionStatus.EXECUTING:
-            return None
-        
         # TODO: Well, we just can't seem to get the bytes between edit start & end markers to render correctly,.
         # so we're falling back to using a manually managed variable.
         # Of course, this could pose some robustness issues,
         # but given that `send_keys` is denied when there is no running command,
         # this method should work fine in most cases.
-        return self._current_command
-        
-        # command_start = current_output.rfind(_BlockMarker.EDIT_START.value) + len(_BlockMarker.EDIT_START.value)
-        # command_end = current_output.rfind(_BlockMarker.EDIT_END.value)
+        session_status = self._get_session_status(self._cumulative_output)
 
-        # return self._render(current_output[command_start:command_end])
+        if session_status == _SessionStatus.EXECUTING:
+            assert self._current_command_parts is not None and len(self._current_command_parts) > 0, \
+                "Potential bug: session status is EXECUTING but `current_command_parts` is not a non-empty list"
+            return '\n'.join(self._current_command_parts)
+        else:
+            return None
     
     async def _watch_session_finished_loop(self):
         await self._session_finished_event.wait()
@@ -402,6 +407,10 @@ class BlockPtySession:
         # Wake terminal idle waiters when terminal becomes idle
         if (not self._is_session_idle(old_cumulative_output)) \
             and self._is_session_idle(self._cumulative_output):
+            # If new state is AWAITING_COMMAND, clear command buffer
+            if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
+                self._current_command_parts = None
+                
             self._session_idle_event.set()
     
     @staticmethod
