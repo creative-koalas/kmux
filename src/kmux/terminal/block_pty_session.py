@@ -328,10 +328,11 @@ class BlockPtySession:
         if include_all:
             return self._render(cumulative_output)
         
-        command_status = self._get_session_status(cumulative_output)
+        session_status = self._get_session_status(cumulative_output)
         
         # TODO: Did we handle all the possible cases gracefully?
-        if command_status == _SessionStatus.EXECUTING:
+        if session_status in { _SessionStatus.EXECUTING, _SessionStatus.INPUT_COMMAND }:
+            # Render everything after the last EXEC_END marker
             # There's a command currently executing
             last_exec_end_index = cumulative_output.rfind(_BlockMarker.EXEC_END.value)
             return self._render(
@@ -339,7 +340,7 @@ class BlockPtySession:
                     last_exec_end_index + len(_BlockMarker.EXEC_END.value) if last_exec_end_index != -1 else 0:
                 ]
             )
-        else:
+        elif session_status == _SessionStatus.AWAITING_COMMAND:
             # Render everything after the second-to-last EXEC_END marker
             last_exec_end_index = cumulative_output.rfind(_BlockMarker.EXEC_END.value)
             if last_exec_end_index == -1:
@@ -351,6 +352,8 @@ class BlockPtySession:
                 render_start += len(_BlockMarker.EXEC_END.value)
             
             return self._render(cumulative_output[render_start:])
+        else:
+            raise NotImplementedError(f'Error: Invalid command status for `snapshot`: {session_status}')
     
     def get_current_running_command(self) -> str | None:
         """
