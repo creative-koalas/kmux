@@ -92,9 +92,10 @@ async def update_session_description(session_id: str, description: str) -> str:
 async def submit_command(session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
     # FIXME: Update docstring
     """
-    Executes a command in a zsh session.
-    This tool is only available when the zsh session is awaiting command input.
-    It is STRONGLY DISCOURAGED to put a lot of commands in a single call to this method;
+    Submits a command in a zsh session.
+    This tool is only available when the zsh session is awaiting command input
+    or awaiting further command input to complete the current command for parsing (likely with multi-line commands).
+    It is STRONGLY DISCOURAGED execute a lot of commands in one go;
     this can cause the command to run for an extended period of time
     and make it harder to pinpoint what went wrong or which command is blocking, should an error occur.
     Instead, execute one command at a time, examine the outputs, and proceed accordingly,
@@ -103,11 +104,29 @@ async def submit_command(session_id: str, command: str, timeout_seconds: float =
     instead of putting them into a single call to this method with `git clone ...; cd ...; git checkout ...; uv sync; uv run python ...`).
     Execute multiple commands together only when it's necessary,
     e.g., when doing pipe operations like `ps aux | grep ...`.
+
+    Note that the submitted command will not be executed immediately if it is incomplete
+    (e.g., if you submitted `ls \\`);
+    in this case, you need to submit command again to complete the command buffer and send it for execution.
+
+    An example would be to submit `ls \\` followed by `pwd`,
+    which would be equivalent to submitting:
+
+    ```ls
+    pwd
+    ```
+
+    Note that submitting incomplete commands is STRONGLY DISCOURAGED;
+    you should always try to submit complete commands.
+    submitting incomplete commands and complete them later is only supported
+    to account for cases where you accidentally submits an incomplete command
+    and make it possible for you to right the wrongs.
     
-    :param session_id: The ID of the zsh session to execute command.
-    :param command: The command to execute.
+    :param session_id: The ID of the zsh session to submit the command.
+    :param command: The command to submit.
     :param timeout_seconds: The timeout in seconds for the command to execute.
-    This must be no longer than 10 seconds.
+    Only applies if the submitted command is complete and ready for parsing and execution.
+    The timeout must be no longer than 10 seconds.
     DO NOT set a very large timeout for a long-running command;
     if you intend to execute a long-running (or interactive) command,
     use a shorter timeout and let this function call return before the command finishes.
