@@ -461,9 +461,6 @@ class BlockPtySession:
         while cursor < len(output):
             iteration += 1
 
-            # FIXME: Remove this after we confirm that _parse_output works correctly
-            logger.debug(f"_parse_output iter={iteration}: state={state}, cursor={cursor}")
-
             if state == _ParseState.WAIT_EDIT_START:
                 edit_start = output.find(_BlockMarker.EDIT_START.value, cursor)
                 if edit_start == -1:
