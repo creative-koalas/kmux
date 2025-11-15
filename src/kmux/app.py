@@ -90,7 +90,6 @@ async def update_session_description(session_id: str, description: str) -> str:
 
 @mcp.tool()
 async def submit_command(session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
-    # FIXME: Update docstring
     """
     Submits a command in a zsh session.
     This tool is only available when the zsh session is awaiting command input
@@ -160,6 +159,9 @@ async def send_keys(session_id: str, keys: str) -> str:
     """
 
     try:
+        if len(keys) == 0:
+            raise ValueError('Error: keys to send are empty (you did not specify any keys)!')
+
         await terminal_server.send_keys(session_id=session_id, keys=eval(f'"{keys}"'))
         return """Keys sent to terminal session; it may take a few seconds for the running command to process them."""
     except Exception as e:
