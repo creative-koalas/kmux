@@ -122,6 +122,7 @@ class PtySession:
                 # Child process: exec zsh (interactive)
                 env = os.environ.copy()
                 env["ZDOTDIR"] = str(tmp_zshrc_directory)
+                env["NO_GLOBAL_RCS"] = "1"
                 os.execvpe("zsh", ["zsh", "-i"], env)
             else:
                 # Parent process: store handles

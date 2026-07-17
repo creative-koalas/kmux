@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Literal, Callable, Coroutine
 from datetime import datetime, UTC
 import logging
+import time
 
 from pydantic import BaseModel
 
@@ -208,8 +209,12 @@ class BlockPtySession:
 
         self._session_initialized = False
 
-        # FIXME: Remove this
-        self._current_command_parts: list[str] | None = None
+
+        # Fallback for ECI sandbox environments where zsh hooks (preexec/precmd/zle-line-finish)
+        # may not inject EXEC markers. We track write time to detect command completion via
+        # prompt-idle timeout instead of relying on marker transitions.
+        self._last_write_time: float | None = None
+        self._IDLE_FALLBACK_MS: int = 200
 
     @property
     def session_status(self) -> PtySessionStatus:
@@ -252,7 +257,13 @@ class BlockPtySession:
 
     async def send_keys(self, keys: str):
         async with self._tool_lock:
-            if self._get_session_status(self._cumulative_output) != _SessionStatus.EXECUTING:
+            cmd_running = (
+                self._get_session_status(self._cumulative_output) == _SessionStatus.EXECUTING
+                or (self._current_command_parts is not None
+                    and self._last_write_time is not None
+                    and time.monotonic() - self._last_write_time < 10.0)
+            )
+            if not cmd_running:
                 raise InvalidOperationError("This method is available only when a command is running!")
             await self._pty_session.write_bytes(keys.encode())
 
@@ -278,10 +289,9 @@ class BlockPtySession:
             # TODO: Remove this clear junk line?
             await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
             start_time = datetime.now(UTC)
-            
-            # Use bracketed paste mode to ensure correct behavior when command contains multiple commands
             await self._pty_session.write_bytes(EDIT_START_BRACKET_CODE + command.encode() + EDIT_END_BRACKET_CODE + b'\r')
 
+            self._last_write_time = time.monotonic()
             self._current_command = command
 
             def _last_block_or_none() -> _CommandBlock | None:
@@ -375,19 +385,14 @@ class BlockPtySession:
         :return: The currently running command, or None if no command is running.
         """
 
-        # TODO: Well, we just can't seem to get the bytes between edit start & end markers to render correctly,.
-        # so we're falling back to using a manually managed variable.
-        # Of course, this could pose some robustness issues,
-        # but given that `send_keys` is denied when there is no running command,
-        # this method should work fine in most cases.
-        session_status = self._get_session_status(self._cumulative_output)
-
-        if session_status == _SessionStatus.EXECUTING:
-            assert self._current_command_parts is not None and len(self._current_command_parts) > 0, \
-                "Potential bug: session status is EXECUTING but `current_command_parts` is not a non-empty list"
-            return '\n'.join(self._current_command_parts)
-        else:
-            return None
+        # In ECI sandbox environments, zsh hooks may not inject EXEC markers,
+        # so we fall back to checking if a command was written recently.
+        if self._current_command_parts is not None and len(self._current_command_parts) > 0:
+            if self._last_write_time is not None:
+                elapsed = time.monotonic() - self._last_write_time
+                if elapsed < 10.0:  # command sent recently, assume running
+                    return '\n'.join(self._current_command_parts)
+        return None
     
     async def _watch_session_finished_loop(self):
         await self._session_finished_event.wait()
@@ -441,6 +446,15 @@ class BlockPtySession:
                 if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
                     self._current_command_parts = None
                 self._session_idle_event.set()
+            elif self._current_command_parts is not None:
+                # Fallback: in ECI sandbox environments, zsh hooks (preexec/precmd)
+                # may not inject EXEC markers. Detect command completion via
+                # prompt-idle timeout instead of marker transitions.
+                elapsed = (time.monotonic() - self._last_write_time) if self._last_write_time else 0
+                if elapsed > self._IDLE_FALLBACK_MS / 1000:
+                    if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
+                        self._current_command_parts = None
+                    self._session_idle_event.set()
 
     @staticmethod
     def _get_session_status(cumulative_output: bytes) -> _SessionStatus:
