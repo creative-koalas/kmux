@@ -216,7 +216,8 @@ class BlockPtySession:
         # may not inject EXEC markers. We track write time to detect command completion via
         # prompt-idle timeout instead of relying on marker transitions.
         self._last_write_time: float | None = None
-        self._IDLE_FALLBACK_MS: int = 200
+        self._IDLE_FALLBACK_MS: float = 200.0
+        self._COMMAND_RUNNING_WINDOW_S: float = 10.0
 
     @property
     def session_status(self) -> PtySessionStatus:
@@ -258,12 +259,11 @@ class BlockPtySession:
             await self._pty_session.write_bytes(self._root_password.encode() + b'\r')
 
     async def send_keys(self, keys: str):
-        async with self._tool_lock:
             cmd_running = (
                 self._get_session_status(self._cumulative_output) == _SessionStatus.EXECUTING
                 or (self._current_command_parts is not None
                     and self._last_write_time is not None
-                    and time.monotonic() - self._last_write_time < 10.0)
+                    and time.monotonic() - self._last_write_time < self._COMMAND_RUNNING_WINDOW_S)
             )
             if not cmd_running:
                 raise InvalidOperationError("This method is available only when a command is running!")
@@ -292,8 +292,8 @@ class BlockPtySession:
             await self._pty_session.write_bytes(b'\x08' * 1000)  # clear junk
             start_time = datetime.now(UTC)
             await self._pty_session.write_bytes(EDIT_START_BRACKET_CODE + command.encode() + EDIT_END_BRACKET_CODE + b'\r')
-
             self._last_write_time = time.monotonic()
+
             self._current_command = command
 
             def _last_block_or_none() -> _CommandBlock | None:
@@ -392,7 +392,7 @@ class BlockPtySession:
         if self._current_command_parts is not None and len(self._current_command_parts) > 0:
             if self._last_write_time is not None:
                 elapsed = time.monotonic() - self._last_write_time
-                if elapsed < 10.0:  # command sent recently, assume running
+                if elapsed < self._COMMAND_RUNNING_WINDOW_S:
                     return '\n'.join(self._current_command_parts)
         return None
     
@@ -454,8 +454,7 @@ class BlockPtySession:
                 # prompt-idle timeout instead of marker transitions.
                 elapsed = (time.monotonic() - self._last_write_time) if self._last_write_time else 0
                 if elapsed > self._IDLE_FALLBACK_MS / 1000:
-                    if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
-                        self._current_command_parts = None
+                    self._current_command_parts = None
                     self._session_idle_event.set()
 
     @staticmethod
