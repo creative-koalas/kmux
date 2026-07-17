@@ -70,10 +70,11 @@ class PtySession:
         self._chunk_to_be_written: bytes | None = None
         self._child_exited_event: asyncio.Event = asyncio.Event()
 
-        self._pid: int
-        self._master_fd: int
-        self._output_reader_task: asyncio.Task[None]
-        self._close_on_child_exit_task: asyncio.Task[None]
+        self._pid: int | None = None
+        self._master_fd: int | None = None
+        self._output_reader_task: asyncio.Task[None] | None = None
+        self._close_on_child_exit_task: asyncio.Task[None] | None = None
+        self._reap_child_task: asyncio.Task[None] | None = None
 
         self._zshrc_patch: str = zshrc_patch
         self._on_new_output_callback: Callable[[bytes], None] = on_new_output_callback
@@ -81,15 +82,20 @@ class PtySession:
     
     @property
     def status(self) -> PtySessionStatus:
-        if not self._started:
-            return PtySessionStatus.NOT_STARTED
-        elif not self._finished:
-            return PtySessionStatus.RUNNING
-        else:
+        if self._finished:
             return PtySessionStatus.FINISHED
+        elif not self._started:
+            return PtySessionStatus.NOT_STARTED
+        else:
+            return PtySessionStatus.RUNNING
+
+    @property
+    def has_open_resources(self) -> bool:
+        """Whether startup has allocated a PTY process or master file descriptor."""
+        return self._pid is not None or self._master_fd is not None
     
-    def stop(self):
-        self._stop()
+    async def stop(self):
+        await self._stop()
     
     async def write_bytes(self, data: bytes):
         """Writes bytes to the pty session."""
@@ -160,6 +166,9 @@ class PtySession:
 
         This method is idempotent.
         """
+        if self._master_fd is None:
+            return
+
         asyncio.get_running_loop().remove_reader(self._master_fd)
         asyncio.get_running_loop().remove_writer(self._master_fd)
 
@@ -227,31 +236,65 @@ class PtySession:
                 else:
                     raise
 
-    def _stop(self):
+    async def _stop(self):
         if self._finished:
             # Already finished; return
             return
 
-        if not self._started:
+        if not self._started and not self.has_open_resources:
             raise RuntimeError("PTY session not started yet!")
 
         # Cancel the output reader task
-        self._output_reader_task.cancel()
+        if self._output_reader_task is not None:
+            self._output_reader_task.cancel()
+
+        # Explicit shutdown removes the FD before the child-exit watcher can
+        # observe it, so that watcher must not remain pending forever.
+        if self._close_on_child_exit_task is not None \
+            and self._close_on_child_exit_task is not asyncio.current_task():
+            self._close_on_child_exit_task.cancel()
 
         # Gracefully close the PTY master FD
-        self._remove_reader_and_writer()
+        if self._master_fd is not None:
+            self._remove_reader_and_writer()
 
-        try:
-            os.close(self._master_fd)
-        except OSError:
-            pass
+            try:
+                os.close(self._master_fd)
+            except OSError:
+                pass
+            finally:
+                self._master_fd = None
 
-        # Kill the child process if it's still around
-        if psutil.pid_exists(self._pid):
-            os.kill(self._pid, signal.SIGKILL)
+        # Kill the child process if it's still around.
+        child_pid = self._pid
+        if child_pid is not None:
+            try:
+                if psutil.pid_exists(child_pid):
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        # The child can exit after `pid_exists` but before `kill`.
+                        pass
+            finally:
+                self._pid = None
 
         self._finished = True
         self._on_session_closed_callback()
+
+        if child_pid is not None:
+            # Reaping may wait for an uninterruptible child; do not make a
+            # terminal stop (or the server lock around it) wait on that.
+            self._reap_child_task = asyncio.create_task(
+                self._reap_child(child_pid)
+            )
+
+    async def _reap_child(self, pid: int) -> None:
+        """Wait for a child process without blocking the event loop."""
+        try:
+            await asyncio.to_thread(os.waitpid, pid, 0)
+        except (ChildProcessError, ProcessLookupError):
+            # The child may have been reaped elsewhere or exited before kill.
+            pass
 
     async def _read_output_loop(self):
         while True:
@@ -260,7 +303,7 @@ class PtySession:
 
     async def close_on_child_exit_loop(self):
         await self._child_exited_event.wait()
-        self._stop()
+        await self._stop()
 
     async def _write_bytes(self, data: bytes):
         """Write bytes to the pty session."""

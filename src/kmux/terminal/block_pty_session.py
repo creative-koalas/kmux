@@ -233,7 +233,14 @@ class BlockPtySession:
         self._session_initialized = True
     
     async def stop(self):
-        self._pty_session.stop()
+        if self._pty_session.status == PtySessionStatus.NOT_STARTED \
+            and not self._pty_session.has_open_resources:
+            watch_session_finished_task = getattr(self, '_watch_session_finished_task', None)
+            if watch_session_finished_task is not None:
+                watch_session_finished_task.cancel()
+            return
+
+        await self._pty_session.stop()
 
     async def enter_root_password(self):
         async with self._tool_lock:

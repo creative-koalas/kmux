@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import asyncio
+from enum import Enum
 import logging
 from pydantic import BaseModel
 
@@ -22,19 +23,36 @@ class TerminalServerConfig(BaseModel):
     """The generic timeout for tool calls. This applies to all tool calls except `create_session` and `execute_command`."""
 
 
+class SessionLifecycle(str, Enum):
+    STARTING = 'starting'
+    READY = 'ready'
+    STOPPING = 'stopping'
+    TERMINATED = 'terminated'
+    FAILED = 'failed'
+
+
+class SessionOperationError(Exception):
+    def __init__(self, code: str, message: str, *, retryable: bool = False):
+        super().__init__(f'{code}: {message}')
+        self.code = code
+        self.retryable = retryable
+
+
 class TollCallTimeoutError(Exception):
     
     def __init__(self, timeout_seconds: float, message: str | None = None):
         self.timeout_seconds = timeout_seconds
         self.message = message or f"Tool call timeout after {timeout_seconds} seconds"
+        super().__init__(self.message)
 
 
 @dataclass
 class PtySessionItem:
     session: BlockPtySession
+    lifecycle: SessionLifecycle = SessionLifecycle.STARTING
+    state_version: int = 0
     label: str | None = None
     description: str | None = None
-    pending_deletion: bool = False
 
 
 class SessionNotFoundError(Exception):
@@ -57,6 +75,7 @@ class TerminalServer:
 
         self._session_items: dict[str, PtySessionItem] = {}
         self._next_session_id = 0
+        self._is_stopping = False
 
         # This lock only ensures no race conditions on the dictionary itself,
         # but not on individual session items.
@@ -67,6 +86,64 @@ class TerminalServer:
 
         self._stopped_sessions_id_queue: asyncio.Queue[str] = asyncio.Queue()
         self._delete_stopped_sessions_task = asyncio.create_task(self._delete_stopped_sessions_loop())
+
+    @staticmethod
+    def _transition_session(
+        session_item: PtySessionItem,
+        lifecycle: SessionLifecycle,
+    ) -> None:
+        if session_item.lifecycle != lifecycle:
+            session_item.lifecycle = lifecycle
+            session_item.state_version += 1
+
+    def _require_ready_session(self, session_id: str) -> PtySessionItem:
+        session_item = self._session_items.get(session_id)
+
+        if not session_item:
+            raise SessionNotFoundError(f"Session {session_id} not found!")
+
+        if session_item.lifecycle == SessionLifecycle.STARTING:
+            raise SessionOperationError(
+                'SESSION_STARTING',
+                f"Session {session_id} is still starting.",
+                retryable=True,
+            )
+
+        if session_item.lifecycle == SessionLifecycle.STOPPING:
+            raise SessionOperationError(
+                'SESSION_STOPPING',
+                f"Session {session_id} is being deleted.",
+                retryable=True,
+            )
+
+        if session_item.lifecycle == SessionLifecycle.TERMINATED:
+            raise SessionOperationError(
+                'SESSION_TERMINATED',
+                f"Session {session_id} has terminated.",
+            )
+
+        if session_item.lifecycle == SessionLifecycle.FAILED:
+            raise SessionOperationError(
+                'SESSION_FAILED',
+                f"Session {session_id} failed to start.",
+            )
+
+        return session_item
+
+    async def _fail_session_start(
+        self,
+        session_id: str,
+        session_item: PtySessionItem,
+        session: BlockPtySession,
+    ) -> None:
+        try:
+            await session.stop()
+        except Exception:
+            logger.exception(
+                f'Failed to stop Zsh session {session_id} during startup cleanup.'
+            )
+
+        self._transition_session(session_item, SessionLifecycle.FAILED)
     
     async def create_session(self) -> str:
         """
@@ -76,6 +153,12 @@ class TerminalServer:
         :return: The ID of the new session.
         """
         async with self._sessions_lock.writer:
+            if self._is_stopping:
+                raise SessionOperationError(
+                    'SERVER_STOPPING',
+                    'Terminal server is stopping and cannot create sessions.',
+                )
+
             session_id = str(self._next_session_id)
             self._next_session_id += 1
             
@@ -84,8 +167,22 @@ class TerminalServer:
             )
 
             async def signal_deletion():
-                session_item.pending_deletion = True
-                await self._stopped_sessions_id_queue.put(session_id)
+                async with self._sessions_lock.writer:
+                    current_session_item = self._session_items.get(session_id)
+
+                    if current_session_item is None:
+                        return
+
+                    # A startup failure is intentionally retained so callers can
+                    # inspect it. Its cleanup stop also emits this callback.
+                    if current_session_item.lifecycle == SessionLifecycle.FAILED:
+                        return
+
+                    self._transition_session(
+                        current_session_item,
+                        SessionLifecycle.TERMINATED,
+                    )
+                    await self._stopped_sessions_id_queue.put(session_id)
             
             session = BlockPtySession(
                 root_password=self._root_password,
@@ -98,14 +195,39 @@ class TerminalServer:
 
             try:
                 await asyncio.wait_for(session.start(), timeout=self._config.session_startup_timeout_seconds)
-            except asyncio.TimeoutError:
-                logger.warning(f'Zsh session {session_id} failed to initialize within {self._config.session_startup_timeout_seconds} seconds; initialization job moved to background.')
+                self._transition_session(session_item, SessionLifecycle.READY)
+            except asyncio.CancelledError:
+                await self._fail_session_start(session_id, session_item, session)
+                raise
+            except asyncio.TimeoutError as error:
+                await self._fail_session_start(session_id, session_item, session)
+                logger.warning(
+                    f'Zsh session {session_id} failed to initialize within '
+                    f'{self._config.session_startup_timeout_seconds} seconds.'
+                )
+                raise SessionOperationError(
+                    'SESSION_START_TIMEOUT',
+                    f'Session {session_id} did not initialize within '
+                    f'{self._config.session_startup_timeout_seconds} seconds.',
+                ) from error
+            except Exception as error:
+                await self._fail_session_start(session_id, session_item, session)
+                logger.warning(
+                    f'Zsh session {session_id} failed to initialize: {error}'
+                )
+                raise SessionOperationError(
+                    'SESSION_START_FAILED',
+                    f'Session {session_id} failed to initialize.',
+                ) from error
 
         return session_id
     
     async def list_sessions(self) -> str:
         async def lock_guarded_job():
-            if len([item for item in self._session_items.values() if not item.pending_deletion]) == 0:
+            if len([
+                item for item in self._session_items.values()
+                if item.lifecycle not in {SessionLifecycle.STOPPING, SessionLifecycle.TERMINATED}
+            ]) == 0:
                 return "No sessions."
 
             return yaml.dump([
@@ -114,10 +236,19 @@ class TerminalServer:
                     "metadata": {
                         "label": session_item.label,
                         "description": session_item.description,
-                        "runningCommand": session_item.session.get_current_running_command() or "(No command is currently running)"
-                    } if session_item.session.session_initialized else "(Session still initializing...)"
+                        "lifecycle": session_item.lifecycle.value,
+                        "stateVersion": session_item.state_version,
+                        "runningCommand": (
+                            "(Session failed to initialize.)"
+                            if session_item.lifecycle == SessionLifecycle.FAILED
+                            else session_item.session.get_current_running_command()
+                            or "(No command is currently running)"
+                            if session_item.session.session_initialized
+                            else "(Session still initializing...)"
+                        ),
+                    },
                 } for session_id, session_item in self._session_items.items()
-                if not session_item.pending_deletion
+                if session_item.lifecycle not in {SessionLifecycle.STOPPING, SessionLifecycle.TERMINATED}
             ], sort_keys=False, indent=2)
 
         async with self._sessions_lock.reader:
@@ -161,10 +292,7 @@ class TerminalServer:
     
     async def submit_command(self, session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
         async with self._sessions_lock.reader:
-            session_item = self._session_items.get(session_id)
-
-            if not session_item:
-                raise SessionNotFoundError(f"Session {session_id} not found!")
+            session_item = self._require_ready_session(session_id)
             
             # TODO: Parameterize this?
             tool_call_timeout = timeout_seconds + 1
@@ -241,10 +369,7 @@ Current command buffer:
     
     async def send_keys(self, session_id: str, keys: str):
         async def lock_guarded_job():
-            session_item = self._session_items.get(session_id)
-
-            if not session_item:
-                raise SessionNotFoundError(f"Session {session_id} not found!")
+            session_item = self._require_ready_session(session_id)
             
             await session_item.session.send_keys(keys)
 
@@ -257,10 +382,7 @@ Current command buffer:
     
     async def enter_root_password(self, session_id: str):
         async def lock_guarded_job():
-            session_item = self._session_items.get(session_id)
-
-            if not session_item:
-                raise SessionNotFoundError(f"Session {session_id} not found!")
+            session_item = self._require_ready_session(session_id)
             
             await session_item.session.enter_root_password()
 
@@ -278,8 +400,16 @@ Current command buffer:
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
-            session_item.pending_deletion = True
+            was_failed = session_item.lifecycle == SessionLifecycle.FAILED
+            self._transition_session(session_item, SessionLifecycle.STOPPING)
             await session_item.session.stop()
+
+            if was_failed:
+                # Startup cleanup already consumed this session's close callback
+                # to preserve FAILED for diagnostics, so delete it explicitly.
+                self._transition_session(session_item, SessionLifecycle.TERMINATED)
+                del self._session_items[session_id]
+                return
             
             # No need to delete the session;
             # deletion is signaled by the callback invoked when the session is stopped,
@@ -305,6 +435,11 @@ Current command buffer:
                     logger.warning(f'Attempting to delete session {session_id} which is not finished, force stopping it; notice that this is not expected behavior (possible bug)!')
                     await self._session_items[session_id].session.stop()
 
+                self._transition_session(
+                    self._session_items[session_id],
+                    SessionLifecycle.TERMINATED,
+                )
+
                 del self._session_items[session_id]
     
     async def stop(self):
@@ -312,5 +447,27 @@ Current command buffer:
         Stops all current terminal sessions.
         """
 
-        await asyncio.gather(session_item.session.stop() for session_item in self._session_items.values())
-        
+        async with self._sessions_lock.writer:
+            self._is_stopping = True
+            session_items = [
+                session_item for session_item in self._session_items.values()
+                if session_item.lifecycle != SessionLifecycle.TERMINATED
+            ]
+
+            for session_item in session_items:
+                self._transition_session(session_item, SessionLifecycle.STOPPING)
+
+        stop_results = await asyncio.gather(
+            *(session_item.session.stop() for session_item in session_items),
+            return_exceptions=True,
+        )
+        stop_errors = [
+            result for result in stop_results
+            if isinstance(result, BaseException)
+        ]
+
+        for error in stop_errors:
+            logger.error('Failed to stop terminal session: %s', error)
+
+        if stop_errors:
+            raise stop_errors[0]
