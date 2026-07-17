@@ -209,6 +209,8 @@ class BlockPtySession:
 
         self._session_initialized = False
 
+        # FIXME: Remove this — tracks multi-line command parts during bracketed-paste input
+        self._current_command_parts: list[str] | None = None
 
         # Fallback for ECI sandbox environments where zsh hooks (preexec/precmd/zle-line-finish)
         # may not inject EXEC markers. We track write time to detect command completion via
