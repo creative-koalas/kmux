@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import os
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -54,12 +56,9 @@ class PtySessionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(session, "_remove_reader_and_writer") as remove_reader,
             patch("kmux.terminal.pty_session.os.close") as close_fd,
             patch("kmux.terminal.pty_session.psutil.pid_exists", return_value=False),
-            patch(
-                "kmux.terminal.pty_session.asyncio.to_thread",
-                new_callable=AsyncMock,
-            ),
         ):
             await session.stop()
+            await session._reap_child_task
 
         remove_reader.assert_called_once()
         close_fd.assert_called_once_with(42)
@@ -82,42 +81,38 @@ class PtySessionTests(unittest.IsolatedAsyncioTestCase):
                 "kmux.terminal.pty_session.os.kill",
                 side_effect=ProcessLookupError,
             ),
-            patch(
-                "kmux.terminal.pty_session.asyncio.to_thread",
-                new_callable=AsyncMock,
-            ),
         ):
             await session.stop()
+            await session._reap_child_task
 
         on_closed.assert_called_once()
         self.assertEqual(session.status, PtySessionStatus.FINISHED)
 
-    async def test_stop_reaps_child_process_without_blocking_event_loop(self) -> None:
+    async def test_reaper_polls_waitpid_without_blocking_thread(self) -> None:
         session = PtySession()
-        session._started = True
-        session._pid = 999_999
-        session._master_fd = 42
-        reaping_called = asyncio.Event()
+        waitpid_results = [(0, 0), (999_999, 0)]
 
-        async def record_reaping(*_: object) -> tuple[int, int]:
-            reaping_called.set()
-            return 999_999, 0
+        with patch(
+            "kmux.terminal.pty_session.os.waitpid",
+            side_effect=waitpid_results,
+        ) as waitpid:
+            await session._reap_child(999_999)
 
-        with (
-            patch.object(session, "_remove_reader_and_writer"),
-            patch("kmux.terminal.pty_session.os.close"),
-            patch("kmux.terminal.pty_session.psutil.pid_exists", return_value=True),
-            patch("kmux.terminal.pty_session.os.kill"),
-            patch(
-                "kmux.terminal.pty_session.asyncio.to_thread",
-                new_callable=AsyncMock,
-                side_effect=record_reaping,
-            ) as to_thread,
-        ):
-            await session.stop()
+        self.assertEqual(
+            waitpid.call_args_list,
+            [
+                unittest.mock.call(999_999, os.WNOHANG),
+                unittest.mock.call(999_999, os.WNOHANG),
+            ],
+        )
+        self.assertNotIn("asyncio.to_thread", inspect.getsource(PtySession._reap_child))
 
-            await asyncio.wait_for(reaping_called.wait(), timeout=0.1)
-            to_thread.assert_awaited_once_with(os.waitpid, 999_999, 0)
+    async def test_reaper_consumes_expected_os_errors(self) -> None:
+        session = PtySession()
+
+        for error in (ChildProcessError(), ProcessLookupError()):
+            with patch("kmux.terminal.pty_session.os.waitpid", side_effect=error):
+                await session._reap_child(999_999)
 
 
 class PtySessionAsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -126,35 +121,19 @@ class PtySessionAsyncTests(unittest.IsolatedAsyncioTestCase):
         session._started = True
         session._pid = 999_999
         session._master_fd = 42
-        reaping_started = asyncio.Event()
-        allow_reaping_to_finish = asyncio.Event()
+        with (
+            patch.object(session, "_remove_reader_and_writer"),
+            patch("kmux.terminal.pty_session.os.close"),
+            patch("kmux.terminal.pty_session.psutil.pid_exists", return_value=False),
+            patch("kmux.terminal.pty_session.os.waitpid", return_value=(0, 0)),
+        ):
+            await session.stop()
 
-        async def wait_for_reaping(*_: object) -> tuple[int, int]:
-            reaping_started.set()
-            await allow_reaping_to_finish.wait()
-            return 999_999, 0
-
-        stop_task: asyncio.Task[None] | None = None
-        try:
-            with (
-                patch.object(session, "_remove_reader_and_writer"),
-                patch("kmux.terminal.pty_session.os.close"),
-                patch("kmux.terminal.pty_session.psutil.pid_exists", return_value=False),
-                patch(
-                    "kmux.terminal.pty_session.asyncio.to_thread",
-                    new_callable=AsyncMock,
-                    side_effect=wait_for_reaping,
-                ),
-            ):
-                stop_task = asyncio.create_task(session.stop())
-                await reaping_started.wait()
-
-                self.assertTrue(stop_task.done())
-        finally:
-            allow_reaping_to_finish.set()
-            if stop_task is not None:
-                await stop_task
-            await asyncio.sleep(0)
+            self.assertTrue(session._reap_child_task)
+            self.assertFalse(session._reap_child_task.done())
+            session._reap_child_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await session._reap_child_task
 
     async def test_stop_cancels_child_exit_watcher(self) -> None:
         session = PtySession()
@@ -171,10 +150,6 @@ class PtySessionAsyncTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(session, "_remove_reader_and_writer"),
                 patch("kmux.terminal.pty_session.os.close"),
                 patch("kmux.terminal.pty_session.psutil.pid_exists", return_value=False),
-                patch(
-                    "kmux.terminal.pty_session.asyncio.to_thread",
-                    new_callable=AsyncMock,
-                ),
             ):
                 await session.stop()
 
@@ -188,3 +163,34 @@ class PtySessionAsyncTests(unittest.IsolatedAsyncioTestCase):
                 child_exit_task,
                 return_exceptions=True,
             )
+
+    async def test_stop_reaps_real_child_and_closes_real_fd(self) -> None:
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            os.close(write_fd)
+            os.pause()
+            os._exit(0)
+
+        session = PtySession()
+        session._started = True
+        session._pid = pid
+        session._master_fd = read_fd
+        os.close(write_fd)
+
+        try:
+            await session.stop()
+            await asyncio.wait_for(session._reap_child_task, timeout=1.0)
+
+            with self.assertRaises(OSError):
+                os.fstat(read_fd)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 9)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+            with contextlib.suppress(OSError):
+                os.close(read_fd)

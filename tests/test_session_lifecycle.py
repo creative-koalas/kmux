@@ -109,6 +109,23 @@ class CancellableStartingSession:
         self.stop_called = True
 
 
+class StuckStartingSession:
+    instances: list["StuckStartingSession"] = []
+
+    def __init__(self, **_: object) -> None:
+        self.session_initialized = False
+        self.stop_calls = 0
+        self.start_started = asyncio.Event()
+        self.instances.append(self)
+
+    async def start(self) -> None:
+        self.start_started.set()
+        await asyncio.Event().wait()
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+
 class FailingStartSession:
     instances: list["FailingStartSession"] = []
 
@@ -328,6 +345,67 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session_item.lifecycle, SessionLifecycle.TERMINATED)
         self.assertEqual(session_item.state_version, 3)
         self.assertEqual(session.stop_calls, 0)
+
+    async def test_stop_preserves_failed_session_without_stopping_it(self) -> None:
+        session = CountingStopSession()
+        session_item = PtySessionItem(
+            session=session,
+            lifecycle=SessionLifecycle.FAILED,
+            state_version=4,
+        )
+        self.server._session_items["0"] = session_item
+
+        await self.server.stop()
+
+        self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
+        self.assertEqual(session_item.state_version, 4)
+        self.assertEqual(session.stop_calls, 0)
+
+    async def test_stop_governs_stuck_starting_session_without_resurrecting_ready(self) -> None:
+        StuckStartingSession.instances.clear()
+        server = TerminalServer(
+            config=TerminalServerConfig(session_startup_timeout_seconds=None),
+        )
+        create_task: asyncio.Task[str] | None = None
+        try:
+            with patch("kmux.terminal_server.BlockPtySession", StuckStartingSession):
+                create_task = asyncio.create_task(server.create_session())
+                while not StuckStartingSession.instances:
+                    await asyncio.sleep(0)
+                session = StuckStartingSession.instances[0]
+                await session.start_started.wait()
+
+                self.assertEqual(
+                    server._session_items["0"].lifecycle,
+                    SessionLifecycle.STARTING,
+                )
+                await asyncio.wait_for(server.stop(), timeout=0.1)
+
+            self.assertTrue(create_task.done())
+            self.assertTrue(create_task.cancelled())
+            self.assertEqual(session.stop_calls, 1)
+            self.assertEqual(
+                server._session_items["0"].lifecycle,
+                SessionLifecycle.STOPPING,
+            )
+        finally:
+            if create_task is not None and not create_task.done():
+                create_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await create_task
+            if not server._delete_stopped_sessions_task.done():
+                server._delete_stopped_sessions_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await server._delete_stopped_sessions_task
+
+    async def test_stop_closes_cleanup_worker_and_is_idempotent(self) -> None:
+        worker = self.server._delete_stopped_sessions_task
+
+        await self.server.stop()
+        await self.server.stop()
+
+        self.assertTrue(worker.done())
+        self.assertFalse(worker.cancelled())
 
     async def test_stop_waits_for_every_session_before_propagating_stop_error(self) -> None:
         failing_session = FailingStopSession()

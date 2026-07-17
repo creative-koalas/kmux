@@ -287,14 +287,37 @@ class PtySession:
             self._reap_child_task = asyncio.create_task(
                 self._reap_child(child_pid)
             )
+            self._reap_child_task.add_done_callback(
+                self._consume_reap_child_result
+            )
 
     async def _reap_child(self, pid: int) -> None:
         """Wait for a child process without blocking the event loop."""
+        while True:
+            try:
+                reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, ProcessLookupError):
+                # The child may have been reaped elsewhere or exited before kill.
+                return
+
+            if reaped_pid == pid:
+                return
+
+            await asyncio.sleep(0.01)
+
+    @staticmethod
+    def _consume_reap_child_result(task: asyncio.Task[None]) -> None:
+        """Retrieve background reaper failures so asyncio never reports them late."""
         try:
-            await asyncio.to_thread(os.waitpid, pid, 0)
-        except (ChildProcessError, ProcessLookupError):
-            # The child may have been reaped elsewhere or exited before kill.
+            task.result()
+        except asyncio.CancelledError:
             pass
+        except Exception as error:
+            logger.error(
+                "Unexpected error while reaping terminal child process: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def _read_output_loop(self):
         while True:

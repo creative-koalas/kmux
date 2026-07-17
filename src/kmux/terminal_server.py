@@ -75,6 +75,7 @@ class PtySessionItem:
     state_version: int = 0
     label: str | None = None
     description: str | None = None
+    startup_task: asyncio.Task[None] | None = None
 
 
 class SessionNotFoundError(Exception):
@@ -122,6 +123,7 @@ class TerminalServer:
         self._session_items: dict[str, PtySessionItem] = {}
         self._next_session_id = 0
         self._is_stopping = False
+        self._stop_lock = asyncio.Lock()
 
         # This lock only ensures no race conditions on the dictionary itself,
         # but not on individual session items.
@@ -130,7 +132,9 @@ class TerminalServer:
         self._config = config
         self._root_password = root_password
 
-        self._stopped_sessions_id_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._cleanup_worker_sentinel = object()
+        self._cleanup_worker_closing = False
+        self._stopped_sessions_id_queue: asyncio.Queue[str | object] = asyncio.Queue()
         self._delete_stopped_sessions_task = asyncio.create_task(self._delete_stopped_sessions_loop())
 
     @staticmethod
@@ -185,6 +189,13 @@ class TerminalServer:
         session_item: PtySessionItem,
         session: BlockPtySession,
     ) -> None:
+        async with self._sessions_lock.writer:
+            current_session_item = self._session_items.get(session_id)
+            if current_session_item is not session_item \
+                or session_item.lifecycle != SessionLifecycle.STARTING:
+                return
+            self._transition_session(session_item, SessionLifecycle.FAILED)
+
         try:
             await session.stop()
         except Exception:
@@ -192,8 +203,7 @@ class TerminalServer:
                 f'Failed to stop Zsh session {session_id} during startup cleanup.'
             )
 
-        self._transition_session(session_item, SessionLifecycle.FAILED)
-    
+
     async def create_session(self) -> str:
         """
         Creates a new PTY session,
@@ -211,10 +221,6 @@ class TerminalServer:
             session_id = str(self._next_session_id)
             self._next_session_id += 1
             
-            session_item = PtySessionItem(
-                session=None,
-            )
-
             async def signal_deletion():
                 async with self._sessions_lock.writer:
                     current_session_item = self._session_items.get(session_id)
@@ -231,45 +237,64 @@ class TerminalServer:
                         current_session_item,
                         SessionLifecycle.TERMINATED,
                     )
-                    await self._stopped_sessions_id_queue.put(session_id)
+                    if not self._cleanup_worker_closing \
+                        and not self._delete_stopped_sessions_task.done():
+                        await self._stopped_sessions_id_queue.put(session_id)
             
             session = BlockPtySession(
                 root_password=self._root_password,
                 on_session_finished_callback=signal_deletion
             )
 
-            session_item.session = session
+            session_item = PtySessionItem(session=session)
 
             self._session_items[session_id] = session_item
+            startup_task = asyncio.create_task(session.start())
+            session_item.startup_task = startup_task
 
-            try:
-                await asyncio.wait_for(session.start(), timeout=self._config.session_startup_timeout_seconds)
-                self._transition_session(session_item, SessionLifecycle.READY)
-            except asyncio.CancelledError:
-                await self._fail_session_start(session_id, session_item, session)
-                raise
-            except asyncio.TimeoutError as error:
-                await self._fail_session_start(session_id, session_item, session)
-                logger.warning(
-                    f'Zsh session {session_id} failed to initialize within '
-                    f'{self._config.session_startup_timeout_seconds} seconds.'
-                )
-                raise SessionOperationError(
-                    SessionOperationCode.SESSION_START_TIMEOUT,
-                    f'Session {session_id} did not initialize within '
-                    f'{self._config.session_startup_timeout_seconds} seconds.',
-                ) from error
-            except Exception as error:
-                await self._fail_session_start(session_id, session_item, session)
-                logger.warning(
-                    f'Zsh session {session_id} failed to initialize: {error}'
-                )
-                raise SessionOperationError(
-                    SessionOperationCode.SESSION_START_FAILED,
-                    f'Session {session_id} failed to initialize.',
-                ) from error
+        try:
+            await asyncio.wait_for(
+                startup_task,
+                timeout=self._config.session_startup_timeout_seconds,
+            )
 
-        return session_id
+            async with self._sessions_lock.writer:
+                current_session_item = self._session_items.get(session_id)
+                if current_session_item is session_item \
+                    and session_item.lifecycle == SessionLifecycle.STARTING \
+                    and not self._is_stopping:
+                    self._transition_session(session_item, SessionLifecycle.READY)
+                    return session_id
+
+                raise SessionOperationError(
+                    SessionOperationCode.SERVER_STOPPING,
+                    'Terminal server stopped while the session was starting.',
+                )
+        except asyncio.CancelledError:
+            await self._fail_session_start(session_id, session_item, session)
+            raise
+        except asyncio.TimeoutError as error:
+            await self._fail_session_start(session_id, session_item, session)
+            logger.warning(
+                f'Zsh session {session_id} failed to initialize within '
+                f'{self._config.session_startup_timeout_seconds} seconds.'
+            )
+            raise SessionOperationError(
+                SessionOperationCode.SESSION_START_TIMEOUT,
+                f'Session {session_id} did not initialize within '
+                f'{self._config.session_startup_timeout_seconds} seconds.',
+            ) from error
+        except SessionOperationError:
+            raise
+        except Exception as error:
+            await self._fail_session_start(session_id, session_item, session)
+            logger.warning(
+                f'Zsh session {session_id} failed to initialize: {error}'
+            )
+            raise SessionOperationError(
+                SessionOperationCode.SESSION_START_FAILED,
+                f'Session {session_id} failed to initialize.',
+            ) from error
     
     async def list_sessions(self) -> str:
         async def lock_guarded_job():
@@ -498,6 +523,8 @@ Current command buffer:
     async def _delete_stopped_sessions_loop(self):
         while True:
             session_id = await self._stopped_sessions_id_queue.get()
+            if session_id is self._cleanup_worker_sentinel:
+                return
 
             async with self._sessions_lock.writer:
                 if session_id not in self._session_items:
@@ -520,27 +547,42 @@ Current command buffer:
         Stops all current terminal sessions.
         """
 
-        async with self._sessions_lock.writer:
-            self._is_stopping = True
-            session_items = [
-                session_item for session_item in self._session_items.values()
-                if session_item.lifecycle != SessionLifecycle.TERMINATED
+        async with self._stop_lock:
+            async with self._sessions_lock.writer:
+                self._is_stopping = True
+                self._cleanup_worker_closing = True
+                session_items = [
+                    session_item for session_item in self._session_items.values()
+                    if session_item.lifecycle in {
+                        SessionLifecycle.STARTING,
+                        SessionLifecycle.READY,
+                    }
+                ]
+
+                for session_item in session_items:
+                    self._transition_session(session_item, SessionLifecycle.STOPPING)
+                    if session_item.startup_task is not None \
+                        and not session_item.startup_task.done():
+                        session_item.startup_task.cancel()
+
+            if not self._delete_stopped_sessions_task.done():
+                await self._stopped_sessions_id_queue.put(
+                    self._cleanup_worker_sentinel
+                )
+                await self._delete_stopped_sessions_task
+
+            stop_results = await asyncio.gather(
+                *(session_item.session.stop() for session_item in session_items),
+                return_exceptions=True,
+            )
+
+            stop_errors = [
+                result for result in stop_results
+                if isinstance(result, BaseException)
             ]
 
-            for session_item in session_items:
-                self._transition_session(session_item, SessionLifecycle.STOPPING)
+            for error in stop_errors:
+                logger.error('Failed to stop terminal session: %s', error)
 
-        stop_results = await asyncio.gather(
-            *(session_item.session.stop() for session_item in session_items),
-            return_exceptions=True,
-        )
-        stop_errors = [
-            result for result in stop_results
-            if isinstance(result, BaseException)
-        ]
-
-        for error in stop_errors:
-            logger.error('Failed to stop terminal session: %s', error)
-
-        if stop_errors:
-            raise stop_errors[0]
+            if stop_errors:
+                raise stop_errors[0]
