@@ -31,11 +31,33 @@ class SessionLifecycle(str, Enum):
     FAILED = 'failed'
 
 
+class SessionOperationCode(str, Enum):
+    SERVER_STOPPING = 'SERVER_STOPPING'
+    SESSION_NOT_FOUND = 'SESSION_NOT_FOUND'
+    SESSION_STATE_CHANGED = 'SESSION_STATE_CHANGED'
+    SESSION_STARTING = 'SESSION_STARTING'
+    SESSION_STOPPING = 'SESSION_STOPPING'
+    SESSION_TERMINATED = 'SESSION_TERMINATED'
+    SESSION_FAILED = 'SESSION_FAILED'
+    SESSION_START_TIMEOUT = 'SESSION_START_TIMEOUT'
+    SESSION_START_FAILED = 'SESSION_START_FAILED'
+
+
 class SessionOperationError(Exception):
-    def __init__(self, code: str, message: str, *, retryable: bool = False):
-        super().__init__(f'{code}: {message}')
-        self.code = code
+    def __init__(
+        self,
+        code: SessionOperationCode | str,
+        message: str,
+        *,
+        retryable: bool = False,
+        expected_state_version: int | None = None,
+        current_state_version: int | None = None,
+    ):
+        self.code = SessionOperationCode(code)
         self.retryable = retryable
+        self.expected_state_version = expected_state_version
+        self.current_state_version = current_state_version
+        super().__init__(f'{self.code.value}: {message}')
 
 
 class TollCallTimeoutError(Exception):
@@ -58,6 +80,30 @@ class PtySessionItem:
 class SessionNotFoundError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
+
+
+_LIFECYCLE_OPERATION_ERRORS = {
+    SessionLifecycle.STARTING: (
+        SessionOperationCode.SESSION_STARTING,
+        'is still starting.',
+        True,
+    ),
+    SessionLifecycle.STOPPING: (
+        SessionOperationCode.SESSION_STOPPING,
+        'is being deleted.',
+        True,
+    ),
+    SessionLifecycle.TERMINATED: (
+        SessionOperationCode.SESSION_TERMINATED,
+        'has terminated.',
+        False,
+    ),
+    SessionLifecycle.FAILED: (
+        SessionOperationCode.SESSION_FAILED,
+        'failed to start.',
+        False,
+    ),
+}
 
 
 class TerminalServer:
@@ -96,36 +142,39 @@ class TerminalServer:
             session_item.lifecycle = lifecycle
             session_item.state_version += 1
 
-    def _require_ready_session(self, session_id: str) -> PtySessionItem:
+    def _require_ready_session(
+        self,
+        session_id: str,
+        expected_state_version: int | None = None,
+    ) -> PtySessionItem:
         session_item = self._session_items.get(session_id)
 
         if not session_item:
-            raise SessionNotFoundError(f"Session {session_id} not found!")
-
-        if session_item.lifecycle == SessionLifecycle.STARTING:
             raise SessionOperationError(
-                'SESSION_STARTING',
-                f"Session {session_id} is still starting.",
+                SessionOperationCode.SESSION_NOT_FOUND,
+                f"Session {session_id} not found!",
+            )
+
+        if expected_state_version is not None \
+            and session_item.state_version != expected_state_version:
+            raise SessionOperationError(
+                SessionOperationCode.SESSION_STATE_CHANGED,
+                f"Session {session_id} state changed from version "
+                f"{expected_state_version} to {session_item.state_version}; "
+                "refresh session state and retry.",
                 retryable=True,
+                expected_state_version=expected_state_version,
+                current_state_version=session_item.state_version,
             )
 
-        if session_item.lifecycle == SessionLifecycle.STOPPING:
+        if session_item.lifecycle != SessionLifecycle.READY:
+            code, message_suffix, retryable = _LIFECYCLE_OPERATION_ERRORS[
+                session_item.lifecycle
+            ]
             raise SessionOperationError(
-                'SESSION_STOPPING',
-                f"Session {session_id} is being deleted.",
-                retryable=True,
-            )
-
-        if session_item.lifecycle == SessionLifecycle.TERMINATED:
-            raise SessionOperationError(
-                'SESSION_TERMINATED',
-                f"Session {session_id} has terminated.",
-            )
-
-        if session_item.lifecycle == SessionLifecycle.FAILED:
-            raise SessionOperationError(
-                'SESSION_FAILED',
-                f"Session {session_id} failed to start.",
+                code,
+                f"Session {session_id} {message_suffix}",
+                retryable=retryable,
             )
 
         return session_item
@@ -155,7 +204,7 @@ class TerminalServer:
         async with self._sessions_lock.writer:
             if self._is_stopping:
                 raise SessionOperationError(
-                    'SERVER_STOPPING',
+                    SessionOperationCode.SERVER_STOPPING,
                     'Terminal server is stopping and cannot create sessions.',
                 )
 
@@ -206,7 +255,7 @@ class TerminalServer:
                     f'{self._config.session_startup_timeout_seconds} seconds.'
                 )
                 raise SessionOperationError(
-                    'SESSION_START_TIMEOUT',
+                    SessionOperationCode.SESSION_START_TIMEOUT,
                     f'Session {session_id} did not initialize within '
                     f'{self._config.session_startup_timeout_seconds} seconds.',
                 ) from error
@@ -216,7 +265,7 @@ class TerminalServer:
                     f'Zsh session {session_id} failed to initialize: {error}'
                 )
                 raise SessionOperationError(
-                    'SESSION_START_FAILED',
+                    SessionOperationCode.SESSION_START_FAILED,
                     f'Session {session_id} failed to initialize.',
                 ) from error
 
@@ -290,9 +339,18 @@ class TerminalServer:
                 logger.warning(f'`update_session_description` timed out after {self._config.general_tool_call_timeout_seconds} seconds')
                 raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
-    async def submit_command(self, session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
+    async def submit_command(
+        self,
+        session_id: str,
+        command: str,
+        timeout_seconds: float = 5.0,
+        expected_state_version: int | None = None,
+    ) -> str:
         async with self._sessions_lock.reader:
-            session_item = self._require_ready_session(session_id)
+            session_item = self._require_ready_session(
+                session_id,
+                expected_state_version,
+            )
             
             # TODO: Parameterize this?
             tool_call_timeout = timeout_seconds + 1
@@ -367,9 +425,17 @@ Current command buffer:
                 logger.warning(f'`snapshot` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
                 raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
-    async def send_keys(self, session_id: str, keys: str):
+    async def send_keys(
+        self,
+        session_id: str,
+        keys: str,
+        expected_state_version: int | None = None,
+    ):
         async def lock_guarded_job():
-            session_item = self._require_ready_session(session_id)
+            session_item = self._require_ready_session(
+                session_id,
+                expected_state_version,
+            )
             
             await session_item.session.send_keys(keys)
 
@@ -380,9 +446,16 @@ Current command buffer:
                 logger.warning(f'`send_keys` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
                 raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
     
-    async def enter_root_password(self, session_id: str):
+    async def enter_root_password(
+        self,
+        session_id: str,
+        expected_state_version: int | None = None,
+    ):
         async def lock_guarded_job():
-            session_item = self._require_ready_session(session_id)
+            session_item = self._require_ready_session(
+                session_id,
+                expected_state_version,
+            )
             
             await session_item.session.enter_root_password()
 

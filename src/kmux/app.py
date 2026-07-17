@@ -89,7 +89,12 @@ async def update_session_description(session_id: str, description: str) -> str:
 
 
 @mcp.tool()
-async def submit_command(session_id: str, command: str, timeout_seconds: float = 5.0) -> str:
+async def submit_command(
+    session_id: str,
+    command: str,
+    timeout_seconds: float = 5.0,
+    expected_state_version: int | None = None,
+) -> str:
     """
     Submits a command in a zsh session.
     This tool is only available when the zsh session is awaiting command input
@@ -124,6 +129,7 @@ async def submit_command(session_id: str, command: str, timeout_seconds: float =
     :param session_id: The ID of the zsh session to submit the command.
     :param command: The command to submit.
     :param timeout_seconds: The timeout in seconds for the command to execute.
+    :param expected_state_version: The session state version observed by the caller.
     Only applies if the submitted command is complete and ready for parsing and execution.
     The timeout must be no longer than 10 seconds.
     DO NOT set a very large timeout for a long-running command;
@@ -138,12 +144,21 @@ async def submit_command(session_id: str, command: str, timeout_seconds: float =
 If you intend to execute a long-running command, use a shorter timeout and try again.
 This function call will likely timeout and return (but the command keeps running),
 and you can check the status of the command later.""")
-        return await terminal_server.submit_command(session_id=session_id, command=command, timeout_seconds=timeout_seconds)
+        return await terminal_server.submit_command(
+            session_id=session_id,
+            command=command,
+            timeout_seconds=timeout_seconds,
+            expected_state_version=expected_state_version,
+        )
     except Exception as e:
         return f"""Failed to execute command. Error: "{e}"."""
 
 @mcp.tool()
-async def send_keys(session_id: str, keys: str) -> str:
+async def send_keys(
+    session_id: str,
+    keys: str,
+    expected_state_version: int | None = None,
+) -> str:
     """
     Sends keys to a zsh session.
     This is useful with e.g., interactive CLI tools like `vim` or `npx create-next-app@latest ...`,
@@ -152,6 +167,7 @@ async def send_keys(session_id: str, keys: str) -> str:
     
     :param session_id: The ID of the zsh session to send keys.
     :param keys: The keys to send. This string will be parsed with a Python `eval` and escape codes are supported.
+    :param expected_state_version: The session state version observed by the caller.
     For example, passing "koala\r" effectively simulates typing "koala" and pressing Enter,
     and passing "\x03" effectively simulates Ctrl-C.
     You may escape the special characters in the idiomatic way;
@@ -162,14 +178,21 @@ async def send_keys(session_id: str, keys: str) -> str:
         if len(keys) == 0:
             raise ValueError('Error: keys to send are empty (you did not specify any keys)!')
 
-        await terminal_server.send_keys(session_id=session_id, keys=eval(f'"{keys}"'))
+        await terminal_server.send_keys(
+            session_id=session_id,
+            keys=eval(f'"{keys}"'),
+            expected_state_version=expected_state_version,
+        )
         return """Keys sent to terminal session; it may take a few seconds for the running command to process them."""
     except Exception as e:
         return f"""Failed to send keys. Error: "{e}"."""
 
 
 @mcp.tool()
-async def enter_root_password(session_id: str) -> str:
+async def enter_root_password(
+    session_id: str,
+    expected_state_version: int | None = None,
+) -> str:
     """
     Enters the root password for a zsh session,
     i.e., simulates typing password and pressing Enter.
@@ -177,10 +200,14 @@ async def enter_root_password(session_id: str) -> str:
     For this tool to be available, root privilege must also be enabled on the zsh session.
     
     :param session_id: The ID of the zsh session to enter root password.
+    :param expected_state_version: The session state version observed by the caller.
     """
 
     try:
-        await terminal_server.enter_root_password(session_id=session_id)
+        await terminal_server.enter_root_password(
+            session_id=session_id,
+            expected_state_version=expected_state_version,
+        )
         return """Root password entered."""
     except Exception as e:
         return f"""Failed to enter root password. Error: "{e}"."""
