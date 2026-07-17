@@ -288,17 +288,19 @@ class BlockPtySession:
                 blocks = self._parse_output(self._cumulative_output)
                 return blocks[-1] if blocks else None
 
+            def _cleanup_if_idle() -> None:
+                if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
+                    self._current_command_parts = None
+
             try:
                 await asyncio.wait_for(self._session_idle_event.wait(), timeout=timeout_seconds)
                 end_time = datetime.now(UTC)
                 duration = (end_time - start_time).total_seconds()
 
-
                 last_block = _last_block_or_none()
 
                 if last_block is None or last_block.output is None:
-                    if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
-                        self._current_command_parts = None
+                    _cleanup_if_idle()
                     return CommandSubmissionResult(
                         result_type='command_incomplete',
                         output=last_block.output if last_block is not None else None,
@@ -307,8 +309,7 @@ class BlockPtySession:
                         timeout_seconds=None
                     )
                 else:
-                    if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
-                        self._current_command_parts = None
+                    _cleanup_if_idle()
                     return CommandSubmissionResult(
                         result_type='finished',
                         output=last_block.output,
@@ -318,9 +319,7 @@ class BlockPtySession:
                     )
             except asyncio.TimeoutError:
                 last_block = _last_block_or_none()
-
-                if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
-                    self._current_command_parts = None
+                _cleanup_if_idle()
 
                 return CommandSubmissionResult(
                     result_type='timeout',
