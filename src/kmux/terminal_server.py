@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 class TerminalServerConfig(BaseModel):
     session_startup_timeout_seconds: float | None = 10.0
     """The timeout for session startup and initialization.
-    If None, the server will wait and hold the lock indefinitely until the session is initialized
-    (this is not recommended)."""
+    If None, the server will wait indefinitely until the session is initialized,
+    without holding the global sessions lock."""
     
     general_tool_call_timeout_seconds: float | None = 5.0
     """The generic timeout for tool calls. This applies to all tool calls except `create_session` and `execute_command`."""
@@ -76,6 +76,7 @@ class PtySessionItem:
     label: str | None = None
     description: str | None = None
     startup_task: asyncio.Task[None] | None = None
+    shutdown_stop_pending: bool = False
 
 
 class SessionNotFoundError(Exception):
@@ -134,6 +135,7 @@ class TerminalServer:
 
         self._cleanup_worker_sentinel = object()
         self._cleanup_worker_closing = False
+        self._cleanup_worker_sentinel_enqueued = False
         self._stopped_sessions_id_queue: asyncio.Queue[str | object] = asyncio.Queue()
         self._delete_stopped_sessions_task = asyncio.create_task(self._delete_stopped_sessions_loop())
 
@@ -553,28 +555,48 @@ Current command buffer:
                 self._cleanup_worker_closing = True
                 session_items = [
                     session_item for session_item in self._session_items.values()
-                    if session_item.lifecycle in {
-                        SessionLifecycle.STARTING,
-                        SessionLifecycle.READY,
-                    }
+                    if session_item.lifecycle in {SessionLifecycle.STARTING, SessionLifecycle.READY}
+                    or session_item.lifecycle == SessionLifecycle.STOPPING
+                    and session_item.shutdown_stop_pending
                 ]
 
                 for session_item in session_items:
                     self._transition_session(session_item, SessionLifecycle.STOPPING)
+                    session_item.shutdown_stop_pending = True
                     if session_item.startup_task is not None \
                         and not session_item.startup_task.done():
                         session_item.startup_task.cancel()
 
             if not self._delete_stopped_sessions_task.done():
-                await self._stopped_sessions_id_queue.put(
-                    self._cleanup_worker_sentinel
-                )
-                await self._delete_stopped_sessions_task
+                if not self._cleanup_worker_sentinel_enqueued:
+                    self._stopped_sessions_id_queue.put_nowait(
+                        self._cleanup_worker_sentinel
+                    )
+                    self._cleanup_worker_sentinel_enqueued = True
+                await asyncio.shield(self._delete_stopped_sessions_task)
 
-            stop_results = await asyncio.gather(
-                *(session_item.session.stop() for session_item in session_items),
-                return_exceptions=True,
-            )
+            stop_tasks = [
+                asyncio.create_task(session_item.session.stop())
+                for session_item in session_items
+            ]
+            try:
+                stop_results = await asyncio.gather(
+                    *stop_tasks,
+                    return_exceptions=True,
+                )
+            except asyncio.CancelledError:
+                stop_results = await asyncio.gather(
+                    *stop_tasks,
+                    return_exceptions=True,
+                )
+                for session_item, result in zip(session_items, stop_results):
+                    if not isinstance(result, BaseException):
+                        session_item.shutdown_stop_pending = False
+                raise
+
+            for session_item, result in zip(session_items, stop_results):
+                if not isinstance(result, BaseException):
+                    session_item.shutdown_stop_pending = False
 
             stop_errors = [
                 result for result in stop_results

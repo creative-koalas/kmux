@@ -34,10 +34,12 @@ class FakeBlockPtySession:
 
 class BlockingStopSession:
     def __init__(self) -> None:
+        self.stop_calls = 0
         self.stop_started = asyncio.Event()
         self.allow_stop = asyncio.Event()
 
     async def stop(self) -> None:
+        self.stop_calls += 1
         self.stop_started.set()
         await self.allow_stop.wait()
 
@@ -170,6 +172,16 @@ class FailingStopSession:
     async def stop(self) -> None:
         self.stop_calls += 1
         raise RuntimeError("failed to stop terminal")
+
+
+class FailsOnceStopSession:
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        if self.stop_calls == 1:
+            raise RuntimeError("first stop failed")
 
 
 class UninitializedSession:
@@ -427,6 +439,43 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await stop_task
 
         self.assertEqual(failing_session.stop_calls, 1)
+
+    async def test_stop_retry_stops_session_after_first_stop_is_cancelled(self) -> None:
+        session = BlockingStopSession()
+        session_item = PtySessionItem(
+            session=session,
+            lifecycle=SessionLifecycle.READY,
+        )
+        self.server._session_items["0"] = session_item
+
+        first_stop = asyncio.create_task(self.server.stop())
+        await asyncio.wait_for(session.stop_started.wait(), timeout=0.1)
+        first_stop.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(first_stop, timeout=0.1)
+
+        session.allow_stop.set()
+        await asyncio.wait_for(self.server.stop(), timeout=0.1)
+
+        self.assertEqual(session.stop_calls, 2)
+        self.assertEqual(session_item.lifecycle, SessionLifecycle.STOPPING)
+
+    async def test_stop_retry_attempts_session_again_after_stop_error(self) -> None:
+        session = FailsOnceStopSession()
+        session_item = PtySessionItem(
+            session=session,
+            lifecycle=SessionLifecycle.READY,
+        )
+        self.server._session_items["0"] = session_item
+
+        with self.assertLogs("kmux.terminal_server", level="ERROR"):
+            with self.assertRaisesRegex(RuntimeError, "first stop failed"):
+                await asyncio.wait_for(self.server.stop(), timeout=0.1)
+
+        await asyncio.wait_for(self.server.stop(), timeout=0.1)
+
+        self.assertEqual(session.stop_calls, 2)
+        self.assertEqual(session_item.lifecycle, SessionLifecycle.STOPPING)
 
     async def test_stop_rejects_new_session_creation_after_shutdown_begins(self) -> None:
         running_session = BlockingStopSession()
