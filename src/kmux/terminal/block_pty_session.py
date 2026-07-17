@@ -314,6 +314,12 @@ class BlockPtySession:
                 # Command timed out
                 # TODO: Does it work for the case where it's the parsing by Zsh that timed out?
                 last_block = self._parse_output(self._cumulative_output)[-1]
+
+                # Safety net: if the command actually completed (session is idle)
+                # but all output arrived in one chunk so _on_new_output never
+                # detected a transition, clean up _current_command_parts here.
+                if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
+                    self._current_command_parts = None
                 
                 return CommandSubmissionResult(
                     result_type='timeout',
@@ -409,25 +415,32 @@ class BlockPtySession:
 
         # FIXME: This would remove the deliberately added leading and trailing blank lines and spaces in the original bytes as well
         return content.rstrip()
-    
     def _on_new_output(self, data: bytes):
         old_cumulative_output = self._cumulative_output
         self._cumulative_output += data
 
+        was_idle = self._is_session_idle(old_cumulative_output)
+        is_idle_now = self._is_session_idle(self._cumulative_output)
+
         # Wake terminal idle waiters when terminal becomes idle
-        if (not self._is_session_idle(old_cumulative_output)) \
-            and self._is_session_idle(self._cumulative_output):
-            # If new state is AWAITING_COMMAND, clear command buffer
+        if not was_idle and is_idle_now:
+            # Normal transition: command completed across multiple output chunks
             if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
                 self._current_command_parts = None
-                
             self._session_idle_event.set()
-    
-    @staticmethod
-    def _is_session_idle(cumulative_output: bytes) -> _SessionStatus:
-        # _NO_MARKERS is considered "not idle", since the session is not ready to accept inputs at this point;
-        # this is the expected design choice.
-        return BlockPtySession._get_session_status(cumulative_output) in { _SessionStatus.AWAITING_COMMAND, _SessionStatus.INPUT_COMMAND }
+        elif was_idle and is_idle_now:
+            # Session was idle before and is idle after this chunk.
+            # This happens when a fast command (e.g. printf) produces
+            # all its output — including EXEC markers and the next prompt —
+            # within a single PTY read.
+            new_markers = _extract_markers(data)
+            if any(
+                m in (_BlockMarker.EXEC_START, _BlockMarker.EXEC_END)
+                for m in new_markers
+            ):
+                if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
+                    self._current_command_parts = None
+                self._session_idle_event.set()
 
     @staticmethod
     def _get_session_status(cumulative_output: bytes) -> _SessionStatus:
