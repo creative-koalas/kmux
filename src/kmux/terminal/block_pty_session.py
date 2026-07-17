@@ -284,25 +284,31 @@ class BlockPtySession:
 
             self._current_command = command
 
+            def _last_block_or_none() -> _CommandBlock | None:
+                blocks = self._parse_output(self._cumulative_output)
+                return blocks[-1] if blocks else None
+
             try:
                 await asyncio.wait_for(self._session_idle_event.wait(), timeout=timeout_seconds)
                 end_time = datetime.now(UTC)
                 duration = (end_time - start_time).total_seconds()
 
-                last_block = self._parse_output(self._cumulative_output)[-1]
 
-                if last_block.output is None:
-                    # Incomplete command; command is not executed
+                last_block = _last_block_or_none()
+
+                if last_block is None or last_block.output is None:
+                    if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
+                        self._current_command_parts = None
                     return CommandSubmissionResult(
                         result_type='command_incomplete',
-                        output=None,
+                        output=last_block.output if last_block is not None else None,
                         command_buffer=combined_command_buffer,
                         duration_seconds=duration,
                         timeout_seconds=None
                     )
                 else:
-                    # Command successfully submitted and sent for execution
-                    # TODO: Could there be a case where `last_block.output` is not `None` but the command has not finished executing?
+                    if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
+                        self._current_command_parts = None
                     return CommandSubmissionResult(
                         result_type='finished',
                         output=last_block.output,
@@ -311,19 +317,14 @@ class BlockPtySession:
                         timeout_seconds=None
                     )
             except asyncio.TimeoutError:
-                # Command timed out
-                # TODO: Does it work for the case where it's the parsing by Zsh that timed out?
-                last_block = self._parse_output(self._cumulative_output)[-1]
+                last_block = _last_block_or_none()
 
-                # Safety net: if the command actually completed (session is idle)
-                # but all output arrived in one chunk so _on_new_output never
-                # detected a transition, clean up _current_command_parts here.
                 if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
                     self._current_command_parts = None
-                
+
                 return CommandSubmissionResult(
                     result_type='timeout',
-                    output=last_block.output,
+                    output=last_block.output if last_block is not None else None,
                     command_buffer=combined_command_buffer,
                     duration_seconds=None,
                     timeout_seconds=timeout_seconds
