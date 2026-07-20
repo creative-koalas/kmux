@@ -230,9 +230,13 @@ class TerminalServer:
                     if current_session_item is None:
                         return
 
-                    # A startup failure is intentionally retained so callers can
-                    # inspect it. Its cleanup stop also emits this callback.
-                    if current_session_item.lifecycle == SessionLifecycle.FAILED:
+                    # Startup owns failures until READY. In particular, a PTY
+                    # closing before its initial marker must be retained as
+                    # FAILED rather than queued for terminated-session cleanup.
+                    if current_session_item.lifecycle in {
+                        SessionLifecycle.STARTING,
+                        SessionLifecycle.FAILED,
+                    }:
                         return
 
                     self._transition_session(
@@ -260,11 +264,20 @@ class TerminalServer:
                 timeout=self._config.session_startup_timeout_seconds,
             )
 
+            if not session.session_initialized:
+                raise RuntimeError(
+                    f'Zsh session {session_id} startup completed before marker initialization.'
+                )
+
             async with self._sessions_lock.writer:
                 current_session_item = self._session_items.get(session_id)
                 if current_session_item is session_item \
                     and session_item.lifecycle == SessionLifecycle.STARTING \
                     and not self._is_stopping:
+                    if session.session_status != PtySessionStatus.RUNNING:
+                        raise RuntimeError(
+                            f'Zsh session {session_id} closed before READY transition.'
+                        )
                     self._transition_session(session_item, SessionLifecycle.READY)
                     return session_id
 

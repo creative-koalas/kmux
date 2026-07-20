@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from kmux.terminal.pty_session import PtySessionStatus
 from kmux.terminal_server import (
     PtySessionItem,
     SessionLifecycle,
@@ -27,6 +28,10 @@ class FakeBlockPtySession:
 
     async def start(self) -> None:
         self.session_initialized = True
+
+    @property
+    def session_status(self) -> PtySessionStatus:
+        return PtySessionStatus.RUNNING
 
     async def finish(self) -> None:
         await self._on_session_finished_callback()
@@ -89,6 +94,21 @@ class SlowStartingSession:
 
     async def start(self) -> None:
         await asyncio.Event().wait()
+
+    async def stop(self) -> None:
+        self.stop_called = True
+
+
+class StartReturnsUninitializedSession:
+    instances: list["StartReturnsUninitializedSession"] = []
+
+    def __init__(self, **_: object) -> None:
+        self.session_initialized = False
+        self.stop_called = False
+        self.instances.append(self)
+
+    async def start(self) -> None:
+        pass
 
     async def stop(self) -> None:
         self.stop_called = True
@@ -165,6 +185,44 @@ class FailingStartAndClosingSession:
         self.callback_finished.set()
 
 
+class ClosesDuringStartSession:
+    instances: list["ClosesDuringStartSession"] = []
+
+    def __init__(self, **kwargs: object) -> None:
+        self.session_initialized = False
+        self.stop_called = False
+        self._on_session_finished_callback = kwargs["on_session_finished_callback"]
+        self.instances.append(self)
+
+    async def start(self) -> None:
+        await self._on_session_finished_callback()
+        raise RuntimeError("zsh closed before marker initialization")
+
+    async def stop(self) -> None:
+        self.stop_called = True
+
+
+class ReadyThenClosesDuringStartSession:
+    instances: list["ReadyThenClosesDuringStartSession"] = []
+
+    def __init__(self, **kwargs: object) -> None:
+        self.session_initialized = False
+        self.stop_called = False
+        self._on_session_finished_callback = kwargs["on_session_finished_callback"]
+        self.instances.append(self)
+
+    @property
+    def session_status(self) -> PtySessionStatus:
+        return PtySessionStatus.FINISHED
+
+    async def start(self) -> None:
+        self.session_initialized = True
+        await self._on_session_finished_callback()
+
+    async def stop(self) -> None:
+        self.stop_called = True
+
+
 class FailingStopSession:
     def __init__(self) -> None:
         self.stop_calls = 0
@@ -217,6 +275,22 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session_item.lifecycle, SessionLifecycle.READY)
         self.assertEqual(session_item.state_version, 1)
+
+    async def test_create_rejects_false_ready_session(self) -> None:
+        StartReturnsUninitializedSession.instances.clear()
+
+        with patch(
+            "kmux.terminal_server.BlockPtySession",
+            StartReturnsUninitializedSession,
+        ):
+            with self.assertRaises(SessionOperationError) as caught:
+                await self.server.create_session()
+
+        session_item = self.server._session_items["0"]
+        self.assertEqual(caught.exception.code, "SESSION_START_FAILED")
+        self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
+        self.assertEqual(session_item.state_version, 1)
+        self.assertTrue(StartReturnsUninitializedSession.instances[0].stop_called)
 
     async def test_naturally_finished_session_transitions_to_terminated(self) -> None:
         with patch("kmux.terminal_server.BlockPtySession", FakeBlockPtySession):
@@ -587,6 +661,46 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(server._session_items["0"].lifecycle, SessionLifecycle.FAILED)
         self.assertTrue(server._stopped_sessions_id_queue.empty())
+
+    async def test_close_during_start_is_retained_as_failed(self) -> None:
+        ClosesDuringStartSession.instances.clear()
+        await self._stop_cleanup_worker()
+
+        with patch(
+            "kmux.terminal_server.BlockPtySession",
+            ClosesDuringStartSession,
+        ):
+            with self.assertLogs("kmux.terminal_server", level="WARNING"):
+                with self.assertRaises(SessionOperationError) as caught:
+                    await self.server.create_session()
+
+        session_item = self.server._session_items["0"]
+        self.assertEqual(caught.exception.code, "SESSION_START_FAILED")
+        self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
+        self.assertEqual(session_item.state_version, 1)
+        self.assertTrue(ClosesDuringStartSession.instances[0].stop_called)
+        self.assertTrue(self.server._stopped_sessions_id_queue.empty())
+
+    async def test_close_after_marker_before_ready_is_retained_as_failed(self) -> None:
+        ReadyThenClosesDuringStartSession.instances.clear()
+        await self._stop_cleanup_worker()
+
+        with patch(
+            "kmux.terminal_server.BlockPtySession",
+            ReadyThenClosesDuringStartSession,
+        ):
+            with self.assertLogs("kmux.terminal_server", level="WARNING"):
+                with self.assertRaises(SessionOperationError) as caught:
+                    await self.server.create_session()
+
+        session_item = self.server._session_items["0"]
+        self.assertEqual(caught.exception.code, "SESSION_START_FAILED")
+        self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
+        self.assertEqual(session_item.state_version, 1)
+        self.assertTrue(
+            ReadyThenClosesDuringStartSession.instances[0].stop_called
+        )
+        self.assertTrue(self.server._stopped_sessions_id_queue.empty())
 
     async def test_list_sessions_reports_failed_initialization(self) -> None:
         self.server._session_items["0"] = PtySessionItem(

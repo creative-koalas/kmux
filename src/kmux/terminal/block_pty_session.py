@@ -203,6 +203,7 @@ class BlockPtySession:
         self._root_password = root_password
         self._tool_lock = asyncio.Lock()
         self._session_idle_event = asyncio.Event()
+        self._session_ready_event = asyncio.Event()
         self._session_finished_event = asyncio.Event()
         self._on_session_finished_callback = on_session_finished_callback
         self._watch_session_finished_task: asyncio.Task
@@ -212,11 +213,8 @@ class BlockPtySession:
         # FIXME: Remove this — tracks multi-line command parts during bracketed-paste input
         self._current_command_parts: list[str] | None = None
 
-        # Fallback for ECI sandbox environments where zsh hooks (preexec/precmd/zle-line-finish)
-        # may not inject EXEC markers. We track write time to detect command completion via
-        # prompt-idle timeout instead of relying on marker transitions.
+        # Track recent command writes for send_keys/get_current_running_command.
         self._last_write_time: float | None = None
-        self._IDLE_FALLBACK_MS: float = 200.0
         self._COMMAND_RUNNING_WINDOW_S: float = 10.0
 
     @property
@@ -237,6 +235,23 @@ class BlockPtySession:
         
         self._watch_session_finished_task = asyncio.create_task(self._watch_session_finished_loop())
         await self._pty_session.start()
+
+        marker_ready_task = asyncio.create_task(self._session_ready_event.wait())
+        session_finished_task = asyncio.create_task(self._session_finished_event.wait())
+        startup_wait_tasks = (marker_ready_task, session_finished_task)
+        try:
+            await asyncio.wait(startup_wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in startup_wait_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*startup_wait_tasks, return_exceptions=True)
+
+        if not self._session_ready_event.is_set() \
+            or self._pty_session.status != PtySessionStatus.RUNNING:
+            raise RuntimeError(
+                "Zsh session closed before marker initialization completed."
+            )
 
         self._session_initialized = True
     
@@ -429,6 +444,9 @@ class BlockPtySession:
         was_idle = self._is_session_idle(old_cumulative_output)
         is_idle_now = self._is_session_idle(self._cumulative_output)
 
+        if is_idle_now:
+            self._session_ready_event.set()
+
         # Wake terminal idle waiters when terminal becomes idle
         if not was_idle and is_idle_now:
             # Normal transition: command completed across multiple output chunks
@@ -448,14 +466,13 @@ class BlockPtySession:
                 if self._get_session_status(self._cumulative_output) == _SessionStatus.AWAITING_COMMAND:
                     self._current_command_parts = None
                 self._session_idle_event.set()
-            elif self._current_command_parts is not None:
-                # Fallback: in ECI sandbox environments, zsh hooks (preexec/precmd)
-                # may not inject EXEC markers. Detect command completion via
-                # prompt-idle timeout instead of marker transitions.
-                elapsed = (time.monotonic() - self._last_write_time) if self._last_write_time else 0
-                if elapsed > self._IDLE_FALLBACK_MS / 1000:
-                    self._current_command_parts = None
-                    self._session_idle_event.set()
+
+    @staticmethod
+    def _is_session_idle(cumulative_output: bytes) -> bool:
+        return BlockPtySession._get_session_status(cumulative_output) in {
+            _SessionStatus.AWAITING_COMMAND,
+            _SessionStatus.INPUT_COMMAND,
+        }
 
     @staticmethod
     def _get_session_status(cumulative_output: bytes) -> _SessionStatus:
