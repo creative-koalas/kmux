@@ -3,16 +3,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-from pathlib import Path
-from types import SimpleNamespace
 import sys
 import unittest
-from unittest.mock import AsyncMock, patch
-
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from kmux import app
+from kmux.native import NativeTerminalService
 from kmux.terminal_server import (
     PtySessionItem,
     SessionLifecycle,
@@ -52,14 +51,14 @@ class RecordingRootPasswordSession:
 
 
 class StateVersionApiTests(unittest.TestCase):
-    def test_terminal_and_mcp_operations_accept_expected_state_version(self) -> None:
+    def test_terminal_and_native_operations_accept_expected_state_version(self) -> None:
         operations = (
             TerminalServer.submit_command,
             TerminalServer.send_keys,
             TerminalServer.enter_root_password,
-            app.submit_command,
-            app.send_keys,
-            app.enter_root_password,
+            NativeTerminalService.submit_command,
+            NativeTerminalService.send_input,
+            NativeTerminalService.authenticate_privilege,
         )
 
         for operation in operations:
@@ -75,21 +74,20 @@ class StateVersionApiTests(unittest.TestCase):
             SessionOperationError("SESSION_STPOPPING", "Typo in error code")
 
 
-class McpStateVersionForwardingTests(unittest.IsolatedAsyncioTestCase):
+class NativeStateVersionForwardingTests(unittest.IsolatedAsyncioTestCase):
     async def test_submit_command_forwards_expected_state_version(self) -> None:
         terminal_server = SimpleNamespace(
             submit_command=AsyncMock(return_value="command result")
         )
 
-        with patch.object(app, "terminal_server", terminal_server, create=True):
-            result = await app.submit_command(
-                "0",
-                "pwd",
-                timeout_seconds=4.0,
-                expected_state_version=7,
-            )
+        result = await NativeTerminalService(terminal_server).submit_command(
+            "0",
+            "pwd",
+            wait_seconds=4.0,
+            expected_state_version=7,
+        )
 
-        self.assertEqual(result, "command result")
+        self.assertEqual(result["transcript"], "command result")
         terminal_server.submit_command.assert_awaited_once_with(
             session_id="0",
             command="pwd",
@@ -100,8 +98,9 @@ class McpStateVersionForwardingTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_keys_forwards_expected_state_version(self) -> None:
         terminal_server = SimpleNamespace(send_keys=AsyncMock())
 
-        with patch.object(app, "terminal_server", terminal_server, create=True):
-            await app.send_keys("0", "y\\r", expected_state_version=8)
+        await NativeTerminalService(terminal_server).send_input(
+            "0", "y\r", expected_state_version=8
+        )
 
         terminal_server.send_keys.assert_awaited_once_with(
             session_id="0",
@@ -112,8 +111,9 @@ class McpStateVersionForwardingTests(unittest.IsolatedAsyncioTestCase):
     async def test_root_password_forwards_expected_state_version(self) -> None:
         terminal_server = SimpleNamespace(enter_root_password=AsyncMock())
 
-        with patch.object(app, "terminal_server", terminal_server, create=True):
-            await app.enter_root_password("0", expected_state_version=9)
+        await NativeTerminalService(terminal_server).authenticate_privilege(
+            "0", expected_state_version=9
+        )
 
         terminal_server.enter_root_password.assert_awaited_once_with(
             session_id="0",
