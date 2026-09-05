@@ -284,7 +284,7 @@ class BlockPtySession:
                 raise InvalidOperationError("This method is available only when a command is running!")
             await self._pty_session.write_bytes(keys.encode())
 
-    async def submit_command(self, command: str, timeout_seconds: float = 5.0) -> CommandSubmissionResult:
+    async def submit_command(self, command: str, timeout_seconds: float = 330.0) -> CommandSubmissionResult:
         async with self._tool_lock:
             session_status = self._get_session_status(self._cumulative_output)
             if session_status not in { _SessionStatus.AWAITING_COMMAND, _SessionStatus.INPUT_COMMAND }:
@@ -320,7 +320,7 @@ class BlockPtySession:
                     self._current_command_parts = None
 
             try:
-                await asyncio.wait_for(self._session_idle_event.wait(), timeout=timeout_seconds)
+                await self._wait_until_idle(timeout_seconds)
                 end_time = datetime.now(UTC)
                 duration = (end_time - start_time).total_seconds()
 
@@ -356,7 +356,27 @@ class BlockPtySession:
                     timeout_seconds=timeout_seconds
                 )
     
-    async def snapshot(self, include_all: bool = False) -> str:
+    async def _wait_until_idle(self, timeout_seconds: float) -> None:
+        """Observe shell markers or PTY closure without taking ownership of the command."""
+        if self._session_idle_event.is_set():
+            return
+        idle = asyncio.create_task(self._session_idle_event.wait())
+        finished = asyncio.create_task(self._session_finished_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (idle, finished), timeout=timeout_seconds, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                raise TimeoutError
+            if not self._session_idle_event.is_set():
+                raise InvalidOperationError("Terminal closed before command completion was observed.")
+        finally:
+            for waiter in (idle, finished):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(idle, finished, return_exceptions=True)
+
+    async def snapshot(self, include_all: bool = False, wait_seconds: float = 330.0) -> str:
         """
         Returns a snapshot of the current state of the pty session.
         
@@ -364,6 +384,12 @@ class BlockPtySession:
         if include_all is True, it returns the all terminal output starting from terminal startup.
         """
         
+        if wait_seconds > 0:
+            try:
+                await self._wait_until_idle(wait_seconds)
+            except TimeoutError:
+                pass
+
         cumulative_output = self._cumulative_output
         if include_all:
             return self._render(cumulative_output)
@@ -371,7 +397,10 @@ class BlockPtySession:
         session_status = self._get_session_status(cumulative_output)
         
         # TODO: Did we handle all the possible cases gracefully?
-        if session_status in { _SessionStatus.EXECUTING, _SessionStatus.INPUT_COMMAND }:
+        if session_status in {
+            _SessionStatus.EXECUTING, _SessionStatus.INPUT_COMMAND,
+            _SessionStatus.TRANSIENT_ZSH_PROCESSING,
+        }:
             # Render everything after the last EXEC_END marker
             # There's a command currently executing
             last_exec_end_index = cumulative_output.rfind(_BlockMarker.EXEC_END.value)

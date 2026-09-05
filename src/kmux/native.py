@@ -76,13 +76,12 @@ class NativeTerminalService:
         session_id: str,
         command: str,
         *,
-        wait_seconds: float,
+        wait_seconds: float = 330,
         expected_state_version: int | None = None,
     ) -> dict[str, Any]:
         if not command.strip():
             raise TerminalError("INVALID_COMMAND", "command is required.")
-        if wait_seconds < 0 or wait_seconds > 10:
-            raise TerminalError("INVALID_TIMEOUT", "wait_seconds must be between 0 and 10.")
+        _validate_wait(wait_seconds)
         try:
             transcript = await self._terminal.submit_command(
                 session_id=session_id,
@@ -99,9 +98,14 @@ class NativeTerminalService:
             "transcript": transcript,
         }
 
-    async def snapshot(self, session_id: str, *, include_all: bool) -> dict[str, Any]:
+    async def snapshot(
+        self, session_id: str, *, include_all: bool, wait_seconds: float = 330
+    ) -> dict[str, Any]:
+        _validate_wait(wait_seconds)
         try:
-            transcript = await self._terminal.snapshot(session_id, include_all=include_all)
+            transcript = await self._terminal.snapshot(
+                session_id, include_all=include_all, wait_seconds=wait_seconds
+            )
         except Exception as exc:
             raise _terminal_error(exc) from exc
         return {
@@ -143,6 +147,11 @@ class NativeTerminalService:
         except Exception as exc:
             raise _terminal_error(exc) from exc
         return {"session_id": session_id, "credential_submitted": True}
+
+
+def _validate_wait(wait_seconds: float) -> None:
+    if not 0 <= wait_seconds <= 330:
+        raise TerminalError("INVALID_TIMEOUT", "wait_seconds must be between 0 and 330.")
 
 
 def _terminal_error(error: Exception) -> TerminalError:

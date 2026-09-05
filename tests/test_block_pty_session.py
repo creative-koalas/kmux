@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from kmux.terminal.block_pty_session import BlockPtySession, _BlockMarker, _SessionStatus
+from kmux.terminal.block_pty_session import BlockPtySession, InvalidOperationError, _BlockMarker, _SessionStatus
 from kmux.terminal.pty_session import PtySession, PtySessionStatus
 
 
@@ -154,6 +154,71 @@ class BlockPtySessionTests(unittest.IsolatedAsyncioTestCase):
                 submit_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await submit_task
+
+    async def test_snapshot_waits_for_markers_without_serializing_behind_submit(self) -> None:
+        session = BlockPtySession()
+        pty = StartedPtySession()
+        session._pty_session = pty
+        session._cumulative_output = _BlockMarker.EDIT_START.value
+        submit = asyncio.create_task(session.submit_command("echo complete"))
+        await asyncio.wait_for(pty.command_written.wait(), timeout=.2)
+        snapshot = asyncio.create_task(session.snapshot())
+        try:
+            session._on_new_output(b"echo complete" + _BlockMarker.EDIT_END.value)
+            session._on_new_output(_BlockMarker.EXEC_START.value + b"partial\r\n")
+            early = await session.snapshot(wait_seconds=.01)
+            self.assertIn("partial", early)
+            self.assertFalse(snapshot.done())
+            self.assertFalse(submit.done())
+            session._on_new_output(b"complete\r\n" + _BlockMarker.EXEC_END.value)
+            self.assertFalse(snapshot.done())
+            session._on_new_output(_BlockMarker.EDIT_START.value)
+            result, output = await asyncio.wait_for(asyncio.gather(submit, snapshot), timeout=.2)
+            self.assertEqual(result.result_type, "finished")
+            self.assertIn("complete", output)
+            self.assertFalse(pty.stop_called)
+        finally:
+            for task in (submit, snapshot):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(submit, snapshot, return_exceptions=True)
+
+    async def test_cancelled_snapshot_leaves_command_and_other_waiters_running(self) -> None:
+        session = BlockPtySession()
+        pty = StartedPtySession()
+        session._pty_session = pty
+        session._cumulative_output = _BlockMarker.EDIT_START.value
+        await session.submit_command("echo once", timeout_seconds=0)
+        session._on_new_output(b"echo once" + _BlockMarker.EDIT_END.value + _BlockMarker.EXEC_START.value)
+        cancelled = asyncio.create_task(session.snapshot())
+        remaining = asyncio.create_task(session.snapshot())
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled
+        self.assertFalse(remaining.done())
+        self.assertFalse(pty.stop_called)
+        self.assertEqual(len(pty.writes), 2)
+        session._on_new_output(b"once\r\n" + _BlockMarker.EXEC_END.value + _BlockMarker.EDIT_START.value)
+        self.assertIn("once", await asyncio.wait_for(remaining, timeout=.2))
+        self.assertEqual(len(pty.writes), 2)
+
+    async def test_snapshot_returns_on_need_for_input_or_reports_closed_session(self) -> None:
+        session = BlockPtySession()
+        session._cumulative_output = _BlockMarker.EDIT_START.value + _BlockMarker.EDIT_END.value
+        waiting = asyncio.create_task(session.snapshot())
+        await asyncio.sleep(0)
+        session._on_new_output(_BlockMarker.EDIT_START.value)
+        await asyncio.wait_for(waiting, timeout=.2)
+        self.assertEqual(session._get_session_status(session._cumulative_output), _SessionStatus.INPUT_COMMAND)
+
+        session._session_idle_event.clear()
+        session._on_new_output(_BlockMarker.EDIT_END.value + _BlockMarker.EXEC_START.value)
+        waiting = asyncio.create_task(session.snapshot())
+        await asyncio.sleep(0)
+        session._on_session_finished()
+        with self.assertRaisesRegex(InvalidOperationError, "closed before command completion"):
+            await asyncio.wait_for(waiting, timeout=.2)
 
     async def test_stop_before_start_is_safe(self) -> None:
         session = BlockPtySession()

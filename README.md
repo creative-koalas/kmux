@@ -2,6 +2,14 @@
 
 [中文](./README_zh.md)
 
+Workspace providers use `NativeTerminalService` with explicit session IDs.
+`submit_command` and `snapshot` wait up to 330 seconds by default. Both accept
+`wait_seconds` from 0 through 330 for an earlier return. Snapshot waits on the
+existing shell's completion or additional-input markers; it never submits a
+command. Timeout returns the current output, and cancelling a wait leaves the
+command running. PTY closure before a completion marker is an error, not proof
+that the command completed.
+
 Terminal MCP server of the AI, for the AI, but by Creative Koalas.
 
 ## What is kmux?
