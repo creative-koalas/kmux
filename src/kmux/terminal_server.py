@@ -383,7 +383,7 @@ class TerminalServer:
         self,
         session_id: str,
         command: str,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float = 330.0,
         expected_state_version: int | None = None,
     ) -> str:
         async with self._sessions_lock.reader:
@@ -443,7 +443,9 @@ Current command buffer:
 </command>
 """
     
-    async def snapshot(self, session_id: str, include_all: bool = False) -> str:
+    async def snapshot(
+        self, session_id: str, include_all: bool = False, wait_seconds: float = 330.0
+    ) -> str:
         
         async def lock_guarded_job():
             session_item = self._session_items.get(session_id)
@@ -451,19 +453,22 @@ Current command buffer:
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
             
-            snapshot = await session_item.session.snapshot(include_all=include_all)
+            snapshot = await session_item.session.snapshot(
+                include_all=include_all, wait_seconds=wait_seconds
+            )
 
             return f"""Terminal snapshot ({'including all outputs' if include_all else 'starting from last command input'}):
 <snapshot>
 {snapshot}
 </snapshot>"""
 
+        tool_call_timeout = wait_seconds + 1
         async with self._sessions_lock.reader:
             try:
-                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
+                return await asyncio.wait_for(lock_guarded_job(), timeout=tool_call_timeout)
             except asyncio.TimeoutError:
-                logger.warning(f'`snapshot` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
-                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
+                logger.warning(f'`snapshot` timeout after {tool_call_timeout} seconds')
+                raise TollCallTimeoutError(tool_call_timeout)
     
     async def send_keys(
         self,
