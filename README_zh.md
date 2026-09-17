@@ -2,6 +2,9 @@
 
 [English](./README.md)
 
+> [!NOTE]
+> **Psygo 架构部署说明**：在 Psygo 平台内部，`kmux` 作为终端交互核心组件打包预装在 **`vm-agent` 沙箱镜像**（`WORKSPACE_IMAGE`）中，无需单独部署 Kubernetes 实例。如需更新沙箱内的 kmux，请参考 [vm-agent 部署指南](../virtual-computer-service/vm-agent/docs/deployment.md) 重建镜像。
+
 专为AI打造的终端MCP工具，由创意考拉打造。
 
 ## 什么是 kmux？

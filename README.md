@@ -2,6 +2,9 @@
 
 [中文](./README_zh.md)
 
+> [!NOTE]
+> **Psygo Architecture & Deployment Notice**: Within the Psygo platform, `kmux` is bundled as a pre-installed terminal tool inside the **`vm-agent` sandbox image** (`WORKSPACE_IMAGE`). It is not deployed as a standalone Kubernetes service. To update `kmux` in staging or production, refer to the [vm-agent deployment guide](../virtual-computer-service/vm-agent/docs/deployment.md).
+
 Workspace providers use `NativeTerminalService` with explicit session IDs.
 `submit_command` and `snapshot` wait up to 330 seconds by default. Both accept
 `wait_seconds` from 0 through 330 for an earlier return. Snapshot waits on the
