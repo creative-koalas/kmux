@@ -1,3 +1,4 @@
+from collections.abc import Awaitable
 from dataclasses import dataclass
 import asyncio
 from enum import Enum
@@ -127,7 +128,11 @@ class TerminalServer:
         self._stop_lock = asyncio.Lock()
 
         # This lock only ensures no race conditions on the dictionary itself,
-        # but not on individual session items.
+        # but not on individual session items. Never hold it while waiting on
+        # a PTY: aiorwlock makes every new reader wait behind a waiting
+        # writer, so one long holder stalls every session in the workspace.
+        # Lifecycle checks and transitions are synchronous (no await between
+        # check and update), so they are atomic on the event loop.
         self._sessions_lock = RWLock()
 
         self._config = config
@@ -174,16 +179,45 @@ class TerminalServer:
             )
 
         if session_item.lifecycle != SessionLifecycle.READY:
-            code, message_suffix, retryable = _LIFECYCLE_OPERATION_ERRORS[
-                session_item.lifecycle
-            ]
-            raise SessionOperationError(
-                code,
-                f"Session {session_id} {message_suffix}",
-                retryable=retryable,
-            )
+            raise self._lifecycle_error(session_id, session_item.lifecycle)
 
         return session_item
+
+    @staticmethod
+    def _lifecycle_error(
+        session_id: str,
+        lifecycle: SessionLifecycle,
+    ) -> SessionOperationError:
+        code, message_suffix, retryable = _LIFECYCLE_OPERATION_ERRORS[lifecycle]
+        return SessionOperationError(
+            code,
+            f"Session {session_id} {message_suffix}",
+            retryable=retryable,
+        )
+
+    @staticmethod
+    def _stopped_session_error(
+        session_id: str,
+        session_item: PtySessionItem,
+    ) -> SessionOperationError | None:
+        """The lifecycle error for an operation whose session stopped under it.
+
+        An operation cut short because the terminal closed (deleted or exited)
+        reports SESSION_TERMINATED. Returns None while the session is still
+        live, so the original error is reported.
+        """
+        lifecycle = session_item.lifecycle
+        if lifecycle != SessionLifecycle.FAILED \
+            and session_item.session.session_status == PtySessionStatus.FINISHED:
+            lifecycle = SessionLifecycle.TERMINATED
+        elif lifecycle not in {
+            SessionLifecycle.STOPPING,
+            SessionLifecycle.TERMINATED,
+            SessionLifecycle.FAILED,
+        }:
+            return None
+
+        return TerminalServer._lifecycle_error(session_id, lifecycle)
 
     async def _fail_session_start(
         self,
@@ -391,18 +425,25 @@ class TerminalServer:
                 session_id,
                 expected_state_version,
             )
-            
-            # TODO: Parameterize this?
-            tool_call_timeout = timeout_seconds + 1
-            
-            try:
-                result = await asyncio.wait_for(session_item.session.submit_command(command, timeout_seconds=timeout_seconds), timeout=tool_call_timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f'`BlockPtySession.execute_command` timeout after {tool_call_timeout} seconds (command execution timeout was {timeout_seconds} seconds)')
-                return f"Tool call itself timeout after {tool_call_timeout} seconds. Command may or may not have been submitted to the terminal session; consider coming back and checking this terminal session later."
 
-            if result.result_type == 'finished':
-                return f"""Command finished in {result.duration_seconds:.2f} seconds.
+        # The command wait runs outside the registry lock; deleting the
+        # session ends it with the session's lifecycle error.
+        # TODO: Parameterize this?
+        tool_call_timeout = timeout_seconds + 1
+
+        try:
+            result = await asyncio.wait_for(session_item.session.submit_command(command, timeout_seconds=timeout_seconds), timeout=tool_call_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f'`BlockPtySession.execute_command` timeout after {tool_call_timeout} seconds (command execution timeout was {timeout_seconds} seconds)')
+            return f"Tool call itself timeout after {tool_call_timeout} seconds. Command may or may not have been submitted to the terminal session; consider coming back and checking this terminal session later."
+        except Exception as error:
+            stopped_error = self._stopped_session_error(session_id, session_item)
+            if stopped_error is not None:
+                raise stopped_error from error
+            raise
+
+        if result.result_type == 'finished':
+            return f"""Command finished in {result.duration_seconds:.2f} seconds.
 
 Executed command buffer:
 <command>
@@ -413,8 +454,8 @@ Command output:
 <command-output>
 {result.output}
 </command-output>"""
-            elif result.result_type == 'timeout':
-                return f"""Command is still running after {result.timeout_seconds:.2f} seconds;
+        elif result.result_type == 'timeout':
+            return f"""Command is still running after {result.timeout_seconds:.2f} seconds;
 this could mean the command is doing blocking operations (e.g., disk reading, downloading)
 or is awaiting input (e.g., password, confirmation).
 
@@ -432,8 +473,8 @@ Current command output:
 It is recommended to use `snapshot` on this session later to see command status,
 and use `send_keys` or `enter_root_password` to interact with the command if necessary.
 You cannot execute another command on this session until the current command finishes or get terminated."""
-            elif result.result_type == 'command_incomplete':
-                return f"""Current command buffer is incomplete for parsing and execution;
+        elif result.result_type == 'command_incomplete':
+            return f"""Current command buffer is incomplete for parsing and execution;
 call `submit_command` again to complete the command and submit for execution.
 
 Current command buffer:
@@ -443,32 +484,61 @@ Current command buffer:
 </command>
 """
     
+    async def _run_session_operation[T](
+        self,
+        operation_name: str,
+        session_id: str,
+        session_item: PtySessionItem,
+        operation: Awaitable[T],
+        timeout: float | None,
+    ) -> T:
+        """Runs a PTY operation outside the registry lock.
+
+        A session stopped under the operation (e.g. deleted while a snapshot
+        waits) ends it with the session's lifecycle error.
+        """
+        try:
+            return await asyncio.wait_for(operation, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f'`{operation_name}` timeout after {timeout} seconds')
+            raise TollCallTimeoutError(timeout)
+        except Exception as error:
+            stopped_error = self._stopped_session_error(session_id, session_item)
+            if stopped_error is not None:
+                raise stopped_error from error
+            raise
+
     async def snapshot(
         self, session_id: str, include_all: bool = False, wait_seconds: float = 330.0
     ) -> str:
-        
-        async def lock_guarded_job():
+        async with self._sessions_lock.reader:
             session_item = self._session_items.get(session_id)
 
             if not session_item:
                 raise SessionNotFoundError(f"Session {session_id} not found!")
-            
-            snapshot = await session_item.session.snapshot(
-                include_all=include_all, wait_seconds=wait_seconds
-            )
 
-            return f"""Terminal snapshot ({'including all outputs' if include_all else 'starting from last command input'}):
+            if session_item.lifecycle in {
+                SessionLifecycle.STOPPING,
+                SessionLifecycle.TERMINATED,
+            }:
+                raise self._lifecycle_error(session_id, session_item.lifecycle)
+
+        # Waiting for the command happens outside the registry lock, so a
+        # delete never queues behind it; the delete ends this wait instead.
+        snapshot = await self._run_session_operation(
+            'snapshot',
+            session_id,
+            session_item,
+            session_item.session.snapshot(
+                include_all=include_all, wait_seconds=wait_seconds
+            ),
+            timeout=wait_seconds + 1,
+        )
+
+        return f"""Terminal snapshot ({'including all outputs' if include_all else 'starting from last command input'}):
 <snapshot>
 {snapshot}
 </snapshot>"""
-
-        tool_call_timeout = wait_seconds + 1
-        async with self._sessions_lock.reader:
-            try:
-                return await asyncio.wait_for(lock_guarded_job(), timeout=tool_call_timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f'`snapshot` timeout after {tool_call_timeout} seconds')
-                raise TollCallTimeoutError(tool_call_timeout)
     
     async def send_keys(
         self,
@@ -476,69 +546,105 @@ Current command buffer:
         keys: str,
         expected_state_version: int | None = None,
     ):
-        async def lock_guarded_job():
+        async with self._sessions_lock.reader:
             session_item = self._require_ready_session(
                 session_id,
                 expected_state_version,
             )
-            
-            await session_item.session.send_keys(keys)
 
-        async with self._sessions_lock.reader:
-            try:
-                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
-            except asyncio.TimeoutError:
-                logger.warning(f'`send_keys` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
-                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
+        await self._run_session_operation(
+            'send_keys',
+            session_id,
+            session_item,
+            session_item.session.send_keys(keys),
+            timeout=self._config.general_tool_call_timeout_seconds,
+        )
     
     async def enter_root_password(
         self,
         session_id: str,
         expected_state_version: int | None = None,
     ):
-        async def lock_guarded_job():
+        async with self._sessions_lock.reader:
             session_item = self._require_ready_session(
                 session_id,
                 expected_state_version,
             )
-            
-            await session_item.session.enter_root_password()
 
-        async with self._sessions_lock.reader:
-            try:
-                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
-            except asyncio.TimeoutError:
-                logger.warning(f'`enter_root_password` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
-                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
+        await self._run_session_operation(
+            'enter_root_password',
+            session_id,
+            session_item,
+            session_item.session.enter_root_password(),
+            timeout=self._config.general_tool_call_timeout_seconds,
+        )
     
     async def delete_session(self, session_id: str):
-        async def lock_guarded_job():
-            session_item = self._session_items.get(session_id)
-            
-            if not session_item:
-                raise SessionNotFoundError(f"Session {session_id} not found!")
-            
-            was_failed = session_item.lifecycle == SessionLifecycle.FAILED
-            self._transition_session(session_item, SessionLifecycle.STOPPING)
-            await session_item.session.stop()
+        """Stops a session's terminal and processes, then removes the session.
 
-            if was_failed:
-                # Startup cleanup already consumed this session's close callback
-                # to preserve FAILED for diagnostics, so delete it explicitly.
+        Stopping never waits for the registry lock or for other operations on
+        the session: a snapshot or command still waiting on it ends with
+        SESSION_TERMINATED once the terminal is closed, and operations that
+        arrive meanwhile are rejected with SESSION_STOPPING (or
+        SESSION_TERMINATED). Concurrent deletes of one session share the same
+        stop. See `PtySession.stop` for which processes are terminated.
+        """
+        timeout = self._config.general_tool_call_timeout_seconds
+
+        session_item = self._session_items.get(session_id)
+
+        if not session_item:
+            raise SessionNotFoundError(f"Session {session_id} not found!")
+
+        if session_item.lifecycle != SessionLifecycle.TERMINATED:
+            self._transition_session(session_item, SessionLifecycle.STOPPING)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(session_item.session.stop()),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f'`delete_session` timeout after {timeout} seconds while stopping session {session_id}')
+            raise TollCallTimeoutError(timeout)
+
+        if not await self._remove_session(session_id, session_item, timeout):
+            # The session is stopped; only its registry entry remains, and it
+            # is hidden from `list_sessions`. Let the cleanup worker remove it
+            # rather than keep the caller waiting.
+            logger.warning(
+                f'`delete_session` stopped session {session_id} but could not '
+                f'take the registry lock within {timeout} seconds; '
+                'deferring its removal to the cleanup worker'
+            )
+            self._enqueue_stopped_session(session_id)
+
+    async def _remove_session(
+        self,
+        session_id: str,
+        session_item: PtySessionItem,
+        timeout: float | None,
+    ) -> bool:
+        """Removes a stopped session; returns False if the lock timed out."""
+        try:
+            async with asyncio.timeout(timeout):
+                await self._sessions_lock.writer.acquire()
+        except TimeoutError:
+            return False
+
+        try:
+            if self._session_items.get(session_id) is session_item:
                 self._transition_session(session_item, SessionLifecycle.TERMINATED)
                 del self._session_items[session_id]
-                return
-            
-            # No need to delete the session;
-            # deletion is signaled by the callback invoked when the session is stopped,
-            # and the session will be subsequently deleted by the custom garbage collection system
-        
-        async with self._sessions_lock.writer:
-            try:
-                return await asyncio.wait_for(lock_guarded_job(), timeout=self._config.general_tool_call_timeout_seconds)
-            except asyncio.TimeoutError:
-                logger.warning(f'`delete_session` timeout after {self._config.general_tool_call_timeout_seconds} seconds')
-                raise TollCallTimeoutError(self._config.general_tool_call_timeout_seconds)
+        finally:
+            self._sessions_lock.writer.release()
+
+        return True
+
+    def _enqueue_stopped_session(self, session_id: str) -> None:
+        if not self._cleanup_worker_closing \
+            and not self._delete_stopped_sessions_task.done():
+            self._stopped_sessions_id_queue.put_nowait(session_id)
     
     async def _delete_stopped_sessions_loop(self):
         while True:
@@ -546,21 +652,16 @@ Current command buffer:
             if session_id is self._cleanup_worker_sentinel:
                 return
 
-            async with self._sessions_lock.writer:
-                if session_id not in self._session_items:
-                    logger.warning(f'Session with ID {session_id} not found, skipping deletion')
-                    continue
-                
-                if self._session_items[session_id].session.session_status != PtySessionStatus.FINISHED:
-                    logger.warning(f'Attempting to delete session {session_id} which is not finished, force stopping it; notice that this is not expected behavior (possible bug)!')
-                    await self._session_items[session_id].session.stop()
+            session_item = self._session_items.get(session_id)
+            if session_item is None:
+                # Already removed, e.g. by `delete_session`.
+                continue
 
-                self._transition_session(
-                    self._session_items[session_id],
-                    SessionLifecycle.TERMINATED,
-                )
+            if session_item.session.session_status != PtySessionStatus.FINISHED:
+                logger.warning(f'Attempting to delete session {session_id} which is not finished, force stopping it; notice that this is not expected behavior (possible bug)!')
+                await session_item.session.stop()
 
-                del self._session_items[session_id]
+            await self._remove_session(session_id, session_item, timeout=None)
     
     async def stop(self):
         """Stops the server.
