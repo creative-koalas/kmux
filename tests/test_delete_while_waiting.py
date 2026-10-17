@@ -1,6 +1,6 @@
 """Real zsh sessions: deleting a session must not wait for other waiters.
 
-These tests reproduce the STG deadlock: a snapshot waiting (``wait_seconds``)
+These tests reproduce the delete-versus-waiter deadlock: a snapshot waiting (``wait_seconds``)
 on a running command held the registry read lock, ``delete_session`` waited
 for the write lock before stopping the PTY, and the command could only end
 once the PTY was stopped.
