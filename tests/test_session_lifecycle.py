@@ -10,10 +10,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from kmux.terminal.block_pty_session import InvalidOperationError
 from kmux.terminal.pty_session import PtySessionStatus
 from kmux.terminal_server import (
     PtySessionItem,
     SessionLifecycle,
+    SessionNotFoundError,
     SessionOperationError,
     TerminalServer,
     TerminalServerConfig,
@@ -242,6 +244,31 @@ class FailsOnceStopSession:
             raise RuntimeError("first stop failed")
 
 
+class WaitingSnapshotSession:
+    """Mimics BlockPtySession: a snapshot waits until the terminal closes."""
+
+    def __init__(self) -> None:
+        self.stop_calls = 0
+        self.snapshot_started = asyncio.Event()
+        self._closed = asyncio.Event()
+
+    @property
+    def session_status(self) -> PtySessionStatus:
+        return PtySessionStatus.FINISHED if self._closed.is_set() else PtySessionStatus.RUNNING
+
+    async def snapshot(self, **_: object) -> str:
+        self.snapshot_started.set()
+        await self._closed.wait()
+        raise InvalidOperationError("Terminal closed before command completion was observed.")
+
+    async def submit_command(self, *_: object, **__: object) -> None:
+        await self.snapshot()
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        self._closed.set()
+
+
 class UninitializedSession:
     session_initialized = False
 
@@ -351,6 +378,147 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.server.delete_session("0")
 
         self.assertEqual(session.stop_calls, 1)
+        self.assertNotIn("0", self.server._session_items)
+
+    def _add_waiting_session(self, session_id: str = "0") -> WaitingSnapshotSession:
+        session = WaitingSnapshotSession()
+        self.server._session_items[session_id] = PtySessionItem(
+            session=session,
+            lifecycle=SessionLifecycle.READY,
+            state_version=1,
+        )
+        return session
+
+    async def test_delete_ends_snapshot_waiting_on_the_session(self) -> None:
+        session = self._add_waiting_session()
+        snapshot = asyncio.create_task(self.server.snapshot("0", wait_seconds=30))
+        await asyncio.wait_for(session.snapshot_started.wait(), timeout=1)
+
+        await asyncio.wait_for(self.server.delete_session("0"), timeout=1)
+
+        with self.assertRaises(SessionOperationError) as caught:
+            await asyncio.wait_for(snapshot, timeout=1)
+        self.assertEqual(caught.exception.code, "SESSION_TERMINATED")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(session.stop_calls, 1)
+        self.assertNotIn("0", self.server._session_items)
+
+    async def test_delete_ends_command_waiting_on_the_session(self) -> None:
+        session = self._add_waiting_session()
+        submit = asyncio.create_task(
+            self.server.submit_command("0", "sleep 60", timeout_seconds=30)
+        )
+        await asyncio.wait_for(session.snapshot_started.wait(), timeout=1)
+
+        await asyncio.wait_for(self.server.delete_session("0"), timeout=1)
+
+        with self.assertRaises(SessionOperationError) as caught:
+            await asyncio.wait_for(submit, timeout=1)
+        self.assertEqual(caught.exception.code, "SESSION_TERMINATED")
+
+    async def test_delete_stops_session_even_when_registry_lock_is_held(self) -> None:
+        server = TerminalServer(
+            config=TerminalServerConfig(general_tool_call_timeout_seconds=0.05),
+        )
+        session = WaitingSnapshotSession()
+        session_item = PtySessionItem(session=session, lifecycle=SessionLifecycle.READY)
+        server._session_items["0"] = session_item
+        reader_held = asyncio.Event()
+        release_reader = asyncio.Event()
+
+        async def hold_reader() -> None:
+            async with server._sessions_lock.reader:
+                reader_held.set()
+                await release_reader.wait()
+
+        holder = asyncio.create_task(hold_reader())
+        try:
+            await reader_held.wait()
+            with self.assertLogs("kmux.terminal_server", level="WARNING"):
+                await asyncio.wait_for(server.delete_session("0"), timeout=1)
+
+            # Stopped right away; only the registry removal is deferred.
+            self.assertEqual(session.stop_calls, 1)
+            self.assertEqual(session_item.lifecycle, SessionLifecycle.STOPPING)
+
+            release_reader.set()
+            await holder
+            for _ in range(100):
+                if "0" not in server._session_items:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertNotIn("0", server._session_items)
+            self.assertEqual(session_item.lifecycle, SessionLifecycle.TERMINATED)
+        finally:
+            release_reader.set()
+            await asyncio.gather(holder, return_exceptions=True)
+            # aiorwlock < 1.5.1 corrupts its state when a waiting writer is
+            # cancelled, after which no one can take the lock again.
+            await asyncio.wait_for(server.stop(), timeout=1)
+
+    async def test_waiting_snapshot_does_not_block_session_creation(self) -> None:
+        session = self._add_waiting_session()
+        snapshot = asyncio.create_task(self.server.snapshot("0", wait_seconds=30))
+        try:
+            await asyncio.wait_for(session.snapshot_started.wait(), timeout=1)
+
+            with patch("kmux.terminal_server.BlockPtySession", FakeBlockPtySession):
+                session_id = await asyncio.wait_for(
+                    self.server.create_session(), timeout=1
+                )
+
+            self.assertEqual(
+                self.server._session_items[session_id].lifecycle,
+                SessionLifecycle.READY,
+            )
+        finally:
+            snapshot.cancel()
+            await asyncio.gather(snapshot, return_exceptions=True)
+
+    async def test_snapshot_rejects_stopping_and_terminated_sessions(self) -> None:
+        session = self._add_waiting_session()
+
+        for lifecycle in (SessionLifecycle.STOPPING, SessionLifecycle.TERMINATED):
+            with self.subTest(lifecycle=lifecycle):
+                self.server._session_items["0"].lifecycle = lifecycle
+
+                with self.assertRaises(SessionOperationError) as caught:
+                    await self.server.snapshot("0", wait_seconds=30)
+
+                self.assertEqual(caught.exception.code, f"SESSION_{lifecycle.name}")
+                self.assertFalse(session.snapshot_started.is_set())
+
+    async def test_concurrent_deletes_both_succeed(self) -> None:
+        session = BlockingStopSession()
+        self.server._session_items["0"] = PtySessionItem(
+            session=session,
+            lifecycle=SessionLifecycle.READY,
+        )
+
+        first = asyncio.create_task(self.server.delete_session("0"))
+        second = asyncio.create_task(self.server.delete_session("0"))
+        await session.stop_started.wait()
+        await asyncio.sleep(0)
+        session.allow_stop.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+
+        self.assertNotIn("0", self.server._session_items)
+        with self.assertRaises(SessionNotFoundError):
+            await self.server.delete_session("0")
+
+    async def test_delete_does_not_regress_terminated_session(self) -> None:
+        session = CountingStopSession()
+        session_item = PtySessionItem(
+            session=session,
+            lifecycle=SessionLifecycle.TERMINATED,
+            state_version=2,
+        )
+        self.server._session_items["0"] = session_item
+
+        await self.server.delete_session("0")
+
+        self.assertEqual(session_item.lifecycle, SessionLifecycle.TERMINATED)
+        self.assertEqual(session_item.state_version, 2)
         self.assertNotIn("0", self.server._session_items)
 
     async def test_submit_rejects_stopping_session_before_pty_dispatch(self) -> None:

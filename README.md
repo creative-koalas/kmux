@@ -13,6 +13,15 @@ command. Timeout returns the current output, and cancelling a wait leaves the
 command running. PTY closure before a completion marker is an error, not proof
 that the command completed.
 
+`delete_session` never waits for other calls: it closes the terminal at once,
+so a `submit_command` or `snapshot` still waiting on the session fails with
+`SESSION_TERMINATED`, and calls arriving during the delete fail with
+`SESSION_STOPPING`. It then terminates every process in the terminal's POSIX
+session (the shell, the foreground job, and background, `nohup` or disowned
+jobs) with SIGHUP and SIGTERM, then SIGKILL after 2 seconds, and returns once
+they are gone. Processes that leave the session with `setsid` (e.g. daemons)
+are not terminated.
+
 Terminal MCP server of the AI, for the AI, but by Creative Koalas.
 
 ## What is kmux?
