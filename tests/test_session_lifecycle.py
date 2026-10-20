@@ -280,6 +280,12 @@ class ReadySession:
         return None
 
 
+def _only_session_item(server: TerminalServer) -> PtySessionItem:
+    """Returns the one session a test started without receiving its ID."""
+    (session_item,) = server._session_items.values()
+    return session_item
+
+
 class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.server = TerminalServer()
@@ -313,7 +319,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SessionOperationError) as caught:
                 await self.server.create_session()
 
-        session_item = self.server._session_items["0"]
+        session_item = _only_session_item(self.server)
         self.assertEqual(caught.exception.code, "SESSION_START_FAILED")
         self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
         self.assertEqual(session_item.state_version, 1)
@@ -630,7 +636,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await session.start_started.wait()
 
                 self.assertEqual(
-                    server._session_items["0"].lifecycle,
+                    _only_session_item(server).lifecycle,
                     SessionLifecycle.STARTING,
                 )
                 await asyncio.wait_for(server.stop(), timeout=0.1)
@@ -639,7 +645,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(create_task.cancelled())
             self.assertEqual(session.stop_calls, 1)
             self.assertEqual(
-                server._session_items["0"].lifecycle,
+                _only_session_item(server).lifecycle,
                 SessionLifecycle.STOPPING,
             )
         finally:
@@ -750,7 +756,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(SessionOperationError) as caught:
                         await server.create_session()
 
-            session_item = server._session_items["0"]
+            session_item = _only_session_item(server)
             self.assertEqual(caught.exception.code, "SESSION_START_TIMEOUT")
             self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
             self.assertEqual(session_item.state_version, 1)
@@ -779,7 +785,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await create_task
 
-            self.assertEqual(server._session_items["0"].lifecycle, SessionLifecycle.FAILED)
+            self.assertEqual(_only_session_item(server).lifecycle, SessionLifecycle.FAILED)
             self.assertTrue(session.stop_called)
         finally:
             if create_task is not None and not create_task.done():
@@ -799,7 +805,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(SessionOperationError) as caught:
                         await server.create_session()
 
-            session_item = server._session_items["0"]
+            session_item = _only_session_item(server)
             self.assertEqual(caught.exception.code, "SESSION_START_FAILED")
             self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
             self.assertEqual(session_item.state_version, 1)
@@ -827,7 +833,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
         session = FailingStartAndClosingSession.instances[0]
         await session.callback_finished.wait()
 
-        self.assertEqual(server._session_items["0"].lifecycle, SessionLifecycle.FAILED)
+        self.assertEqual(_only_session_item(server).lifecycle, SessionLifecycle.FAILED)
         self.assertTrue(server._stopped_sessions_id_queue.empty())
 
     async def test_close_during_start_is_retained_as_failed(self) -> None:
@@ -842,7 +848,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(SessionOperationError) as caught:
                     await self.server.create_session()
 
-        session_item = self.server._session_items["0"]
+        session_item = _only_session_item(self.server)
         self.assertEqual(caught.exception.code, "SESSION_START_FAILED")
         self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
         self.assertEqual(session_item.state_version, 1)
@@ -861,7 +867,7 @@ class TerminalServerLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(SessionOperationError) as caught:
                     await self.server.create_session()
 
-        session_item = self.server._session_items["0"]
+        session_item = _only_session_item(self.server)
         self.assertEqual(caught.exception.code, "SESSION_START_FAILED")
         self.assertEqual(session_item.lifecycle, SessionLifecycle.FAILED)
         self.assertEqual(session_item.state_version, 1)

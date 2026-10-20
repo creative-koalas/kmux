@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import asyncio
 from enum import Enum
 import logging
+import uuid
 from pydantic import BaseModel
 
 from aiorwlock import RWLock
@@ -12,6 +13,22 @@ from .terminal.block_pty_session import BlockPtySession, PtySessionStatus
 
 
 logger = logging.getLogger(__name__)
+
+
+# The prefix keeps IDs non-numeric, so YAML, JSON and other loosely typed
+# consumers always read them as strings.
+_SESSION_ID_PREFIX = 't_'
+
+
+def _new_session_id() -> str:
+    """Returns a new, opaque terminal session ID.
+
+    IDs carry 122 random bits from `uuid.uuid4()` instead of a per-process
+    counter, so they do not repeat across server restarts or between server
+    instances. A client that remembers an ID from an earlier server process
+    cannot reach a different session that later receives the same ID.
+    """
+    return f'{_SESSION_ID_PREFIX}{uuid.uuid4().hex}'
 
 
 class TerminalServerConfig(BaseModel):
@@ -123,7 +140,6 @@ class TerminalServer:
         """
 
         self._session_items: dict[str, PtySessionItem] = {}
-        self._next_session_id = 0
         self._is_stopping = False
         self._stop_lock = asyncio.Lock()
 
@@ -245,7 +261,8 @@ class TerminalServer:
         Creates a new PTY session,
         returning its ID.
 
-        :return: The ID of the new session.
+        :return: The ID of the new session: an opaque string that is not
+        reused, even after the server restarts.
         """
         async with self._sessions_lock.writer:
             if self._is_stopping:
@@ -254,8 +271,7 @@ class TerminalServer:
                     'Terminal server is stopping and cannot create sessions.',
                 )
 
-            session_id = str(self._next_session_id)
-            self._next_session_id += 1
+            session_id = _new_session_id()
             
             async def signal_deletion():
                 async with self._sessions_lock.writer:
